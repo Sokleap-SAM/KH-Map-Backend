@@ -1,10 +1,24 @@
 import { Module } from '@nestjs/common';
-import { AppController } from './app.controller';
-import { AppService } from './app.service';
+import { ConfigModule } from '@nestjs/config';
+import {
+  appConfig,
+  databaseConfig,
+  redisConfig,
+  mapConfig,
+  envValidationSchema,
+} from './config';
+import { DatabaseModule } from './shared/database/database.module';
+import { RedisModule } from './shared/redis/redis.module';
 
 @Module({
-  imports: [],
-  controllers: [AppController],
-  providers: [AppService],
+  imports: [
+    ConfigModule.forRoot({
+      isGlobal: true,
+      load: [appConfig, databaseConfig, redisConfig, mapConfig],
+      validationSchema: envValidationSchema,
+    }),
+    DatabaseModule,
+    RedisModule,
+  ],
 })
 export class AppModule {}
