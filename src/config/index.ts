@@ -11,3 +11,5 @@ export { mapConfig } from './map.config';
 export type { MapConfig } from './map.config';
 
 export { envValidationSchema } from './env.validation';
+
+export { configureCloudinary, cloudinary } from './cloudinary.config';
