@@ -9,6 +9,8 @@ import {
 } from './config';
 import { DatabaseModule } from './shared/database/database.module';
 import { RedisModule } from './shared/redis/redis.module';
+import { PlaceModule } from './modules/places/place.module';
+// import { TransitModule } from './modules/transit/transit.module';
 
 @Module({
   imports: [
@@ -19,6 +21,8 @@ import { RedisModule } from './shared/redis/redis.module';
     }),
     DatabaseModule,
     RedisModule,
+    PlaceModule,
+    // TransitModule,
   ],
 })
 export class AppModule {}
