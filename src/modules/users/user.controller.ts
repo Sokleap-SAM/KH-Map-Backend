@@ -49,4 +49,23 @@ export class UsersController {
   async login(@Body() loginDto: LoginDto) {
     return this.usersService.login(loginDto);
   }
+
+  @Post('forgot-password')
+  async forgotPassword(@Body('email') email: string) {
+    console.log(
+      '🔔 DOORBELL: Flutter just knocked on /forgot-password with email:',
+      email,
+    );
+    return this.usersService.forgotPassword(email);
+  }
+
+  @Post('reset-password')
+  async resetPassword(
+    @Body('email') email: string,
+    @Body('otp') otp: string,
+    @Body('newPassword') newPassword: string,
+  ) {
+    console.log('🔔 RESET ATTEMPT:', { email, otp }); // Add this to see the attempt
+    return this.usersService.resetPassword(email, otp, newPassword);
+  }
 }
