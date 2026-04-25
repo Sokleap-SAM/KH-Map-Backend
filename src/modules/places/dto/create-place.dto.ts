@@ -1,30 +1,21 @@
-/* eslint-disable @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-assignment */
 import {
+  ArrayMaxSize,
+  ArrayMinSize,
   IsArray,
   IsNotEmpty,
   IsNumber,
   IsOptional,
   IsString,
-  ValidateNested,
+  Max,
+  Min,
 } from 'class-validator';
-import { Transform, Type, plainToInstance } from 'class-transformer';
+import { Transform } from 'class-transformer';
 import { Types } from 'mongoose';
-
-class GeoJsonPointDto {
-  @IsString()
-  @IsNotEmpty()
-  type: 'Point';
-
-  @Transform(({ value }) => (Array.isArray(value) ? value.map(Number) : value))
-  @IsArray()
-  @IsNumber({}, { each: true })
-  coordinates: [number, number];
-}
 
 export class CreatePlaceDto {
   @IsString()
   @IsNotEmpty()
-  name: string;
+  name!: string;
 
   @IsOptional()
   @Transform(({ value }) =>
@@ -32,22 +23,35 @@ export class CreatePlaceDto {
   )
   category?: Types.ObjectId | null;
 
-  @ValidateNested()
-  @Type(() => GeoJsonPointDto)
+  /**
+   * Location as [longitude, latitude] — e.g. [104.9565, 11.4670]
+   * Stored internally as GeoJSON Point.
+   */
   @Transform(({ value }) => {
-    let parsed = value;
+    let coords: number[] = value as number[];
     if (typeof value === 'string') {
       try {
-        parsed = JSON.parse(value);
+        coords = JSON.parse(value) as number[];
       } catch {
-        try {
-          parsed = JSON.parse(value.replace(/'/g, '"'));
-        } catch {
-          return value;
-        }
+        return value;
       }
     }
-    return plainToInstance(GeoJsonPointDto, parsed);
+    return coords.map(Number);
   })
-  location: GeoJsonPointDto;
+  @IsArray()
+  @ArrayMinSize(2, { message: 'location must be [longitude, latitude]' })
+  @ArrayMaxSize(2, {
+    message: 'location must be [longitude, latitude] — do not include altitude',
+  })
+  @IsNumber({}, { each: true })
+  @Min(-180, {
+    each: true,
+    message:
+      'longitude out of range — make sure order is [longitude, latitude]',
+  })
+  @Max(180, {
+    each: true,
+    message: 'latitude out of range — make sure order is [longitude, latitude]',
+  })
+  location!: [number, number];
 }

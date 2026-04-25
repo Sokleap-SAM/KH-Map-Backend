@@ -23,6 +23,7 @@ services:
     image: redis:alpine
     container_name: bus_redis
     command: redis-server --requirepass ${REDIS_PASSWORD}
+    # command: command: redis-server --requirepass ${REDIS_PASSWORD} --save ""
     ports:
       - "${REDIS_PORT}:6379"
     healthcheck:
