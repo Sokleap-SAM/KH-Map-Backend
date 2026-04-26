@@ -12,7 +12,7 @@ import * as bcrypt from 'bcryptjs';
 import { CreateUserDto } from './dto/create-user.dto';
 import { LoginDto } from './dto/login.dto';
 import { JwtService } from '@nestjs/jwt';
-import { REDIS_CLIENT } from 'src/shared/redis/redis.module';
+import { REDIS_CLIENT } from '../../shared/redis/redis.module';
 import Redis from 'ioredis';
 import { MailerService } from '@nestjs-modules/mailer';
 

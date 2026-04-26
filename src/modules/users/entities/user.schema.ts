@@ -1,7 +1,7 @@
 import { HydratedDocument } from 'mongoose';
 import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
-import { BaseEntity } from 'src/shared/database/base.entity';
-import { UserRole } from '../enums/role.enums';
+import { BaseEntity } from '../../../shared/database/base.entity';
+import { UserRole } from '../enums/role.enum';
 
 export type UserDocument = HydratedDocument<User>;
 
@@ -11,20 +11,20 @@ export type UserDocument = HydratedDocument<User>;
 })
 export class User extends BaseEntity {
   @Prop({ required: true })
-  name: string;
+  name!: string;
 
   @Prop({ required: true, unique: true })
-  email: string;
+  email!: string;
 
   @Prop({ required: true })
-  password: string;
+  password!: string;
 
   @Prop({
     type: String,
     enum: UserRole,
     default: UserRole.USER,
   })
-  role: UserRole;
+  role!: UserRole;
 }
 
 export const UserSchema = SchemaFactory.createForClass(User);

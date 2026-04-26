@@ -11,9 +11,9 @@ import { UsersService } from './user.service';
 import { LoginDto } from './dto/login.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CreateUserDto } from './dto/create-user.dto';
-import { RolesGuard } from 'src/common/guards/roles.guard';
-import { UserRole } from './enums/role.enums';
-import { Roles } from 'src/common/decorators/roles.decorator';
+import { RolesGuard } from '../../common/guards/roles.guard';
+import { UserRole } from './enums/role.enum';
+import { Roles } from '../../common/decorators/roles.decorator';
 
 interface AuthenticatedRequest extends Request {
   user: {

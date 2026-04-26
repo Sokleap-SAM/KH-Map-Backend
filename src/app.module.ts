@@ -10,6 +10,8 @@ import {
 import { DatabaseModule } from './shared/database/database.module';
 import { RedisModule } from './shared/redis/redis.module';
 import { UsersModule } from './modules/users/user.module';
+import { PlaceModule } from './modules/places/place.module';
+// import { TransitModule } from './modules/transit/transit.module';
 
 @Module({
   imports: [
@@ -21,6 +23,8 @@ import { UsersModule } from './modules/users/user.module';
     DatabaseModule,
     RedisModule,
     UsersModule,
+    PlaceModule,
+    // TransitModule,
   ],
 })
 export class AppModule {}
