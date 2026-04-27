@@ -1,16 +1,16 @@
 import { Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { MongooseModule } from '@nestjs/mongoose';
-import { DatabaseConfig } from '../../config/database.config';
 
 @Module({
   imports: [
     MongooseModule.forRootAsync({
       inject: [ConfigService],
-      useFactory: (configService: ConfigService) => {
-        const { uri } = configService.get<DatabaseConfig>('database')!;
-        return { uri };
-      },
+      useFactory: (config: ConfigService) => ({
+        uri: config.get<string>('MONGODB_URI'),
+        family: 4,
+        serverSelectionTimeoutMS: 5000,
+      }),
     }),
   ],
 })
