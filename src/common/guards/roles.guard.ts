@@ -1,5 +1,5 @@
 import { CanActivate, ExecutionContext, Injectable } from '@nestjs/common';
-import { UserRole } from 'src/modules/users/enums/role.enums';
+import { UserRole } from '../../modules/users/enums/role.enum';
 import { Reflector } from '@nestjs/core';
 import { Request } from 'express';
 

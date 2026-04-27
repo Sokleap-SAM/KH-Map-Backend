@@ -11,16 +11,8 @@ services:
     env_file:
       - .env
     volumes:
+      - .:/usr/src/app
       - /usr/src/app/node_modules
-    develop:
-      watch:
-        - action: sync
-          path: .
-          target: /usr/src/app
-          ignore:
-            - node_modules/
-        - action: rebuild
-          path: package.json
     depends_on:
       redis:
         condition: service_healthy
