@@ -9,9 +9,9 @@ import {
 } from './config';
 import { DatabaseModule } from './shared/database/database.module';
 import { RedisModule } from './shared/redis/redis.module';
-import { UsersModule } from './modules/users/user.module';
 import { PlaceModule } from './modules/places/place.module';
-// import { TransitModule } from './modules/transit/transit.module';
+import { TransitModule } from './modules/transit/transit.module';
+import { UsersModule } from './modules/users/user.module';
 
 @Module({
   imports: [
@@ -22,9 +22,9 @@ import { PlaceModule } from './modules/places/place.module';
     }),
     DatabaseModule,
     RedisModule,
-    UsersModule,
     PlaceModule,
-    // TransitModule,
+    TransitModule,
+    UsersModule,
   ],
 })
 export class AppModule {}

@@ -22,11 +22,22 @@ export class PlaceService {
     files?: Express.Multer.File[],
   ): Promise<Place> {
     const photos = files?.map((file) => (file as CloudinaryFile).path) ?? [];
-    return this.placeModel.create({ ...dto, photos });
+    const location = { type: 'Point' as const, coordinates: dto.location };
+    return this.placeModel.create({ ...dto, location, photos });
   }
 
   async findAll(): Promise<Place[]> {
     return this.placeModel.find().populate('category').exec();
+  }
+
+  async findByCategory(
+    categoryId: Types.ObjectId,
+  ): Promise<{ _id: Types.ObjectId; name: string }[]> {
+    return this.placeModel
+      .find({ category: categoryId })
+      .select('_id name')
+      .lean()
+      .exec() as Promise<{ _id: Types.ObjectId; name: string }[]>;
   }
 
   async findOne(id: Types.ObjectId): Promise<Place> {
@@ -43,7 +54,11 @@ export class PlaceService {
     dto: UpdatePlaceDto,
     files?: Express.Multer.File[],
   ): Promise<Place> {
-    const updateData: UpdatePlaceDto & { photos?: string[] } = { ...dto };
+    const updateData: Record<string, unknown> = { ...dto };
+
+    if (dto.location) {
+      updateData.location = { type: 'Point', coordinates: dto.location };
+    }
 
     if (files && files.length > 0) {
       const existing = await this.placeModel.findById(id).exec();
