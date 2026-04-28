@@ -79,6 +79,11 @@ export class PlaceController {
     return this.placeService.findAll();
   }
 
+  @Get('category/:categoryId')
+  findByCategory(@Param('categoryId') categoryId: string) {
+    return this.placeService.findByCategory(new Types.ObjectId(categoryId));
+  }
+
   @Get(':id')
   findOne(@Param('id') id: string) {
     return this.placeService.findOne(new Types.ObjectId(id));
