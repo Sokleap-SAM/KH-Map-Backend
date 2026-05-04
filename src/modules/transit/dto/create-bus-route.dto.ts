@@ -1,4 +1,11 @@
-import { IsBoolean, IsOptional, IsString } from 'class-validator';
+import {
+  IsBoolean,
+  IsIn,
+  IsInt,
+  IsOptional,
+  IsString,
+  Min,
+} from 'class-validator';
 
 export class CreateBusRouteDto {
   @IsOptional()
@@ -15,5 +22,12 @@ export class CreateBusRouteDto {
 
   @IsOptional()
   @IsString()
+  @IsIn(['active', 'inactive'])
   status?: string;
+
+  /** Average minutes between successive buses (headway). Used as fallback wait = headway / 2. */
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  headwayMinutes?: number;
 }

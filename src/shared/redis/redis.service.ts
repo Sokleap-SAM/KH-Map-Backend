@@ -96,4 +96,8 @@ export class RedisService {
   async georemove(key: string, member: string): Promise<void> {
     await this.redisClient.zrem(key, member);
   }
+
+  async expire(key: string, ttlSeconds: number): Promise<void> {
+    await this.redisClient.expire(key, ttlSeconds);
+  }
 }

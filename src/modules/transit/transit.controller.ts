@@ -21,6 +21,11 @@ import { CreateBusDto } from './dto/create-bus.dto';
 import { UpdateBusDto } from './dto/update-bus.dto';
 import { CreateBusTripDto } from './dto/create-bus-trip.dto';
 import { UpdateBusTripDto } from './dto/update-bus-trip.dto';
+// import { TransitRoutingService } from './transit-routing.service';
+import { BusLocationService } from './bus-location.service';
+import { BusSimulationService } from './bus-simulation.service';
+// import { PlanRouteDto } from './dto/plan-route.dto';
+import { ReportBusLocationDto } from './dto/report-bus-location.dto';
 
 @Controller('transit')
 export class TransitController {
@@ -29,7 +34,39 @@ export class TransitController {
     private readonly busRouteStopService: BusRouteStopService,
     private readonly busService: BusService,
     private readonly busTripService: BusTripService,
+    // private readonly transitRoutingService: TransitRoutingService,
+    private readonly busLocationService: BusLocationService,
+    private readonly busSimulationService: BusSimulationService,
   ) {}
+
+  // ─── Route Planning ────────────────────────────────────────
+
+  /**
+   * Plan a transit route from origin coordinates to destination coordinates.
+   * Returns walking + bus segments with time and distance estimates.
+   *
+   * GET /transit/plan?originLng=104.928&originLat=11.556&destLng=104.934&destLat=11.572
+   */
+  // @Get('plan')
+  // planRoute(@Query() query: PlanRouteDto) {
+  //   return this.transitRoutingService.planRoute(
+  //     [query.originLng, query.originLat],
+  //     [query.destLng, query.destLat],
+  //   );
+  // }
+
+  // ─── Bus Location (Live Tracking) ─────────────────────────────────
+
+  /**
+   * Called by the bus driver app at regular intervals to report the bus's
+   * current GPS position. Used to compute real-time ETAs during route planning.
+   *
+   * POST /transit/buses/location
+   */
+  @Post('buses/location')
+  reportBusLocation(@Body() dto: ReportBusLocationDto) {
+    return this.busLocationService.reportLocation(dto);
+  }
 
   // ─── Bus Routes ────────────────────────────────────────────
 
@@ -183,5 +220,44 @@ export class TransitController {
   @Delete('trips/:id')
   removeTrip(@Param('id') id: string) {
     return this.busTripService.remove(new Types.ObjectId(id));
+  }
+
+  // ─── Simulation ───────────────────────────────────────────────────────────
+
+  /**
+   * Returns whether the bus simulation loop is currently active and the
+   * number of trips it is tracking.
+   *
+   * GET /transit/simulation/status
+   */
+  @Get('simulation/status')
+  async getSimulationStatus() {
+    const activeTrips = await this.busTripService.findActive();
+    return {
+      running: this.busSimulationService.running,
+      activeTrips: activeTrips.length,
+    };
+  }
+
+  /**
+   * Start the simulation loop (idempotent).
+   *
+   * POST /transit/simulation/start
+   */
+  @Post('simulation/start')
+  startSimulation() {
+    this.busSimulationService.start();
+    return { running: this.busSimulationService.running };
+  }
+
+  /**
+   * Stop the simulation loop (idempotent).
+   *
+   * POST /transit/simulation/stop
+   */
+  @Post('simulation/stop')
+  stopSimulation() {
+    this.busSimulationService.stop();
+    return { running: this.busSimulationService.running };
   }
 }

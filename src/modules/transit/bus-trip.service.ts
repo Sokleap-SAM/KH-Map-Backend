@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-argument */
+/* eslint-disable @typescript-eslint/no-unsafe-return */
 import {
   Injectable,
   NotFoundException,
@@ -15,6 +15,9 @@ import { RedisService } from '../../shared/redis/redis.service';
 // Redis key conventions:
 //   trip:live:{tripId}  → Hash { currentStopIndex, nextStopIndex, passengerCount, lng, lat }
 //   bus:locations        → Geo set with tripId as member
+
+/** TTL (seconds) for simulation trip live data — refreshed on every position update */
+const TRIP_LIVE_TTL_SECONDS = 14_400; // 4 hours
 
 export interface TripLiveData {
   currentStopIndex: number;
@@ -39,14 +42,17 @@ export class BusTripService {
     return `trip:live:${tripId}`;
   }
 
-  private async setLiveData(tripId: string, data: TripLiveData): Promise<void> {
-    await this.redisService.hset(this.tripLiveKey(tripId), {
+  async setLiveData(tripId: string, data: TripLiveData): Promise<void> {
+    const key = this.tripLiveKey(tripId);
+    await this.redisService.hset(key, {
       currentStopIndex: String(data.currentStopIndex),
       nextStopIndex: String(data.nextStopIndex),
       passengerCount: String(data.passengerCount),
       longitude: String(data.longitude),
       latitude: String(data.latitude),
     });
+    // Refresh TTL on every write so abandoned trips eventually expire
+    await this.redisService.expire(key, TRIP_LIVE_TTL_SECONDS);
     await this.redisService.geoadd(
       this.GEO_KEY,
       data.longitude,
@@ -55,7 +61,7 @@ export class BusTripService {
     );
   }
 
-  private async getLiveData(tripId: string): Promise<TripLiveData | null> {
+  async getLiveData(tripId: string): Promise<TripLiveData | null> {
     const data = await this.redisService.hgetall(this.tripLiveKey(tripId));
     if (!data) return null;
     return {
@@ -67,7 +73,7 @@ export class BusTripService {
     };
   }
 
-  private async clearLiveData(tripId: string): Promise<void> {
+  async clearLiveData(tripId: string): Promise<void> {
     await this.redisService.hdel(this.tripLiveKey(tripId));
     await this.redisService.georemove(this.GEO_KEY, tripId);
   }
@@ -179,6 +185,12 @@ export class BusTripService {
       mongoUpdate.status = dto.status;
       if (dto.status === 'in-progress') {
         mongoUpdate.startedAt = new Date();
+        mongoUpdate.completedAt = null;
+      }
+      if (dto.status === 'scheduled') {
+        // Resetting a trip back to scheduled clears both run timestamps
+        mongoUpdate.startedAt = null;
+        mongoUpdate.completedAt = null;
       }
       if (dto.status === 'completed' || dto.status === 'cancelled') {
         mongoUpdate.completedAt = new Date();
@@ -232,7 +244,11 @@ export class BusTripService {
 
     const tripId = id.toString();
     const live = await this.getLiveData(tripId);
-    const nextIndex = live?.nextStopIndex ?? 0;
+    if (!live)
+      throw new BadRequestException(
+        `No live data found for trip ${tripId}. The trip may have expired from Redis.`,
+      );
+    const nextIndex = live.nextStopIndex;
 
     const stops = await this.busRouteStopService.findByRoute(trip.route._id);
 
