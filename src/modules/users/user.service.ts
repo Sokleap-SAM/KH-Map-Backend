@@ -96,13 +96,6 @@ export class UsersService {
     const redisKey = `reset_otp:${cleanEmail}`;
     const savedOtp = await this.redis.get(redisKey);
 
-    // --- DEBUG LOGS ---
-    console.log('--- RESET PASSWORD ATTEMPT ---');
-    console.log('Searching Redis Key:', redisKey);
-    console.log('OTP from Flutter:', `"${cleanOtp}"`);
-    console.log('OTP found in Redis:', `"${savedOtp}"`);
-    // ------------------
-
     if (!savedOtp) {
       throw new BadRequestException(
         'លេខកូដបានហួសកំណត់ (Code expired or not found)',
