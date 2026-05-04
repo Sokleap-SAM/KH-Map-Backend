@@ -1,24 +1,3 @@
-<<<<<<< Updated upstream
-import { IsBoolean, IsOptional, IsString } from 'class-validator';
-
-export class CreateBusRouteDto {
-  @IsOptional()
-  @IsBoolean()
-  isLine?: boolean;
-
-  @IsOptional()
-  @IsString()
-  code?: string;
-
-  @IsOptional()
-  @IsString()
-  name?: string;
-
-  @IsOptional()
-  @IsString()
-  status?: string;
-}
-=======
 import {
   IsBoolean,
   IsIn,
@@ -52,4 +31,3 @@ export class CreateBusRouteDto {
   @Min(1)
   headwayMinutes?: number;
 }
->>>>>>> Stashed changes
