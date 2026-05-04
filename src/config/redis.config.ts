@@ -3,7 +3,7 @@ import { registerAs } from '@nestjs/config';
 export interface RedisConfig {
   host: string;
   port: number;
-  password: string;
+  password?: string;
 }
 
 export const redisConfig = registerAs(
