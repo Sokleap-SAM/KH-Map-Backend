@@ -84,10 +84,7 @@ export class RedisService {
     return result as string[];
   }
 
-  async geopos(
-    key: string,
-    member: string,
-  ): Promise<[string, string] | null> {
+  async geopos(key: string, member: string): Promise<[string, string] | null> {
     const result = await this.redisClient.geopos(key, member);
     if (!result || !result[0]) return null;
     return result[0] as [string, string];
