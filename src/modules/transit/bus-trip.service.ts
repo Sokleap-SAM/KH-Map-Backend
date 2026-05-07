@@ -84,11 +84,26 @@ export class BusTripService {
     await this.redisService.georemove(this.GEO_KEY, tripId);
   }
 
-  private mergeLiveData(trip: any, live: TripLiveData | null) {
+  private async mergeLiveData(trip: any, live: TripLiveData | null) {
+    const routeId = trip.route?._id || trip.route;
+    const stops = await this.busRouteStopService.findByRoute(routeId);
+
+    const nextStop = live && stops[live.nextStopIndex]
+      ? (stops[live.nextStopIndex].stop as any).name
+      : 'ស្វែងរកចំណត...';
+
+    const destination = (stops.length > 0)
+      ? (stops[stops.length -1].stop as any).name
+      : 'មិនច្បាស់លាស់';
+
     return {
       ...trip,
+      routeNumber: trip.route?.code || '??',
+      nextStopName: nextStop,
+      direction: destination,
+      busNumber: trip.bus?.busNumber || 'N/A',
       currentStopIndex: live?.currentStopIndex ?? null,
-      nextStopIndex: live?.nextStopIndex ?? null,
+      nextStopIndex: live?.nextStopIndex ?? 1,
       passengerCount: live?.passengerCount ?? null,
       heading: live?.heading ?? 0,
       busImage: live?.busImage ?? 'bus_go_right.png',
@@ -160,7 +175,7 @@ export class BusTripService {
     return Promise.all(
       trips.map(async (trip) => {
         const live = await this.getLiveData(trip._id.toString());
-        return this.mergeLiveData(trip, live);
+        return await this.mergeLiveData(trip, live);
       }),
     );
   }
