@@ -92,9 +92,8 @@ export class BusTripService {
       ? (stops[live.nextStopIndex].stop as any).name
       : 'ស្វែងរកចំណត...';
 
-    const destination = (stops.length > 0)
-      ? (stops[stops.length -1].stop as any).name
-      : 'មិនច្បាស់លាស់';
+    const destination = trip.route?.name ||
+      'មិនច្បាស់លាស់';
 
     return {
       ...trip,
