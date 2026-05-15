@@ -36,7 +36,7 @@ import { MailerModule } from '@nestjs-modules/mailer';
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
         secret: config.get<string>('JWT_SECRET') || 'SUPER_SECRET_KEY',
-        signOption: { expiresIn: '1d' },
+        signOptions: { expiresIn: '1d' },
       }),
     }),
   ],

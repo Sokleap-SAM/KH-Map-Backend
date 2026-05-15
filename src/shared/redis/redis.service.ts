@@ -154,4 +154,8 @@ export class RedisService {
       this.warnUnavailable('georemove', err);
     }
   }
+
+  async expire(key: string, ttlSeconds: number): Promise<void> {
+    await this.redisClient.expire(key, ttlSeconds);
+  }
 }
