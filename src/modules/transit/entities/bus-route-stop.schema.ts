@@ -23,13 +23,11 @@ export class BusRouteStop extends BaseEntity {
   @Prop({ type: Number, default: null })
   distanceFromPrevious?: number | null;
 
-  @Prop({ type: Number, default: null })
-  estimatedTimeFromPrevious?: number | null;
-
   /**
-   * Road geometry from the previous stop to this stop.
+   * Road geometry from this stop to the next stop in the route sequence.
    * Use multiple coordinates to trace curves/turns along the actual road.
-   * Null for the first stop (no previous segment).
+   * First coordinate should be at this stop's location; last at the next stop.
+   * Null for the last stop (no next segment).
    */
   @Prop(
     raw({

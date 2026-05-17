@@ -21,6 +21,8 @@ export interface LiveBusPosition {
   heading: number | null;
   speed: number | null;
   recordedAt: string; // ISO string
+  /** Index of the last stop the bus departed from — used to prevent "already passed" boarding. */
+  currentStopIndex?: number;
 }
 
 @Injectable()
@@ -52,6 +54,7 @@ export class BusLocationService {
       heading: dto.heading ?? null,
       speed: dto.speed ?? null,
       recordedAt: now.toISOString(),
+      currentStopIndex: dto.currentStopIndex,
     };
     await Promise.all([
       this.redisService.set(

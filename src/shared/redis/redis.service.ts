@@ -97,4 +97,23 @@ export class RedisService {
   async expire(key: string, ttlSeconds: number): Promise<void> {
     await this.redisClient.expire(key, ttlSeconds);
   }
+
+  /**
+   * Set a plain string key only if it does not already exist (NX).
+   * Returns true if the key was set (lock acquired), false if it already existed.
+   */
+  async setnx(
+    key: string,
+    value: string,
+    ttlSeconds: number,
+  ): Promise<boolean> {
+    const result = await this.redisClient.set(
+      key,
+      value,
+      'EX',
+      ttlSeconds,
+      'NX',
+    );
+    return result === 'OK';
+  }
 }

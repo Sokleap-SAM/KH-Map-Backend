@@ -21,10 +21,10 @@ import { CreateBusDto } from './dto/create-bus.dto';
 import { UpdateBusDto } from './dto/update-bus.dto';
 import { CreateBusTripDto } from './dto/create-bus-trip.dto';
 import { UpdateBusTripDto } from './dto/update-bus-trip.dto';
-// import { TransitRoutingService } from './transit-routing.service';
+import { TransitRoutingService } from './transit-routing.service';
 import { BusLocationService } from './bus-location.service';
 import { BusSimulationService } from './bus-simulation.service';
-// import { PlanRouteDto } from './dto/plan-route.dto';
+import { PlanRouteDto } from './dto/plan-route.dto';
 import { ReportBusLocationDto } from './dto/report-bus-location.dto';
 
 @Controller('transit')
@@ -34,7 +34,7 @@ export class TransitController {
     private readonly busRouteStopService: BusRouteStopService,
     private readonly busService: BusService,
     private readonly busTripService: BusTripService,
-    // private readonly transitRoutingService: TransitRoutingService,
+    private readonly transitRoutingService: TransitRoutingService,
     private readonly busLocationService: BusLocationService,
     private readonly busSimulationService: BusSimulationService,
   ) {}
@@ -42,18 +42,21 @@ export class TransitController {
   // ─── Route Planning ────────────────────────────────────────
 
   /**
-   * Plan a transit route from origin coordinates to destination coordinates.
-   * Returns walking + bus segments with time and distance estimates.
+   * Plan a route from origin to destination.
    *
-   * GET /transit/plan?originLng=104.928&originLat=11.556&destLng=104.934&destLat=11.572
+   * type=walk   — returns a single walking-only path (no transit)
+   * type=transit — returns up to 3 walking+bus options (must include a bus)
+   *
+   * GET /transit/plan?originLng=104.928&originLat=11.556&destLng=104.934&destLat=11.572&type=transit
    */
-  // @Get('plan')
-  // planRoute(@Query() query: PlanRouteDto) {
-  //   return this.transitRoutingService.planRoute(
-  //     [query.originLng, query.originLat],
-  //     [query.destLng, query.destLat],
-  //   );
-  // }
+  @Get('plan')
+  planRoute(@Query() query: PlanRouteDto): Promise<unknown> {
+    return this.transitRoutingService.planRoute(
+      [query.originLng, query.originLat],
+      [query.destLng, query.destLat],
+      query.type,
+    );
+  }
 
   // ─── Bus Location (Live Tracking) ─────────────────────────────────
 
@@ -71,8 +74,10 @@ export class TransitController {
   // ─── Bus Routes ────────────────────────────────────────────
 
   @Post('routes')
-  createRoute(@Body() dto: CreateBusRouteDto) {
-    return this.busRouteService.create(dto);
+  async createRoute(@Body() dto: CreateBusRouteDto) {
+    const result = await this.busRouteService.create(dto);
+    this.transitRoutingService.invalidateNetworkCache();
+    return result;
   }
 
   @Get('routes')
@@ -97,20 +102,29 @@ export class TransitController {
   }
 
   @Patch('routes/:id')
-  updateRoute(@Param('id') id: string, @Body() dto: UpdateBusRouteDto) {
-    return this.busRouteService.update(new Types.ObjectId(id), dto);
+  async updateRoute(@Param('id') id: string, @Body() dto: UpdateBusRouteDto) {
+    const result = await this.busRouteService.update(
+      new Types.ObjectId(id),
+      dto,
+    );
+    this.transitRoutingService.invalidateNetworkCache();
+    return result;
   }
 
   @Delete('routes/:id')
-  removeRoute(@Param('id') id: string) {
-    return this.busRouteService.remove(new Types.ObjectId(id));
+  async removeRoute(@Param('id') id: string) {
+    const result = await this.busRouteService.remove(new Types.ObjectId(id));
+    this.transitRoutingService.invalidateNetworkCache();
+    return result;
   }
 
   // ─── Route Stops ───────────────────────────────────────────
 
   @Post('route-stops')
-  createRouteStop(@Body() dto: CreateBusRouteStopDto) {
-    return this.busRouteStopService.create(dto);
+  async createRouteStop(@Body() dto: CreateBusRouteStopDto) {
+    const result = await this.busRouteStopService.create(dto);
+    this.transitRoutingService.invalidateNetworkCache();
+    return result;
   }
 
   @Get('routes/:routeId/stops')
@@ -131,13 +145,25 @@ export class TransitController {
   }
 
   @Patch('route-stops/:id')
-  updateRouteStop(@Param('id') id: string, @Body() dto: UpdateBusRouteStopDto) {
-    return this.busRouteStopService.update(new Types.ObjectId(id), dto);
+  async updateRouteStop(
+    @Param('id') id: string,
+    @Body() dto: UpdateBusRouteStopDto,
+  ) {
+    const result = await this.busRouteStopService.update(
+      new Types.ObjectId(id),
+      dto,
+    );
+    this.transitRoutingService.invalidateNetworkCache();
+    return result;
   }
 
   @Delete('route-stops/:id')
-  removeRouteStop(@Param('id') id: string) {
-    return this.busRouteStopService.remove(new Types.ObjectId(id));
+  async removeRouteStop(@Param('id') id: string) {
+    const result = await this.busRouteStopService.remove(
+      new Types.ObjectId(id),
+    );
+    this.transitRoutingService.invalidateNetworkCache();
+    return result;
   }
 
   // ─── Buses ─────────────────────────────────────────────────
@@ -245,8 +271,8 @@ export class TransitController {
    * POST /transit/simulation/start
    */
   @Post('simulation/start')
-  startSimulation() {
-    this.busSimulationService.start();
+  async startSimulation() {
+    await this.busSimulationService.start();
     return { running: this.busSimulationService.running };
   }
 

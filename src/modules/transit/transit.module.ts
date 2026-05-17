@@ -8,14 +8,14 @@ import {
 import { Bus, BusSchema } from './entities/bus.schema';
 import { BusTrip, BusTripSchema } from './entities/bus-trip.schema';
 import { BusLocation, BusLocationSchema } from './entities/bus-location.schema';
-// import { Place, PlaceSchema } from '../places/entities/place.schema';
+import { Place, PlaceSchema } from '../places/entities/place.schema';
 import { TransitController } from './transit.controller';
 import { BusRouteService } from './bus-route.service';
 import { BusRouteStopService } from './bus-route-stop.service';
 import { BusService } from './bus.service';
 import { BusTripService } from './bus-trip.service';
 import { BusLocationService } from './bus-location.service';
-// import { TransitRoutingService } from './transit-routing.service';
+import { TransitRoutingService } from './transit-routing.service';
 import { BusSimulationService } from './bus-simulation.service';
 import { OsrmService } from './osrm.service';
 
@@ -27,7 +27,7 @@ import { OsrmService } from './osrm.service';
       { name: Bus.name, schema: BusSchema },
       { name: BusTrip.name, schema: BusTripSchema },
       { name: BusLocation.name, schema: BusLocationSchema },
-      // { name: Place.name, schema: PlaceSchema },
+      { name: Place.name, schema: PlaceSchema },
     ]),
   ],
   controllers: [TransitController],
@@ -37,7 +37,7 @@ import { OsrmService } from './osrm.service';
     BusService,
     BusTripService,
     BusLocationService,
-    // TransitRoutingService,
+    TransitRoutingService,
     BusSimulationService,
     OsrmService,
   ],
