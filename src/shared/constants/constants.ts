@@ -18,6 +18,14 @@ export const TRANSFER_WALK_MAX_RADIUS_M = 3000;
 /** Backward-compatible alias for existing callers expecting a single transfer radius. */
 export const TRANSFER_WALK_RADIUS_M = TRANSFER_WALK_BASE_RADIUS_M;
 
+export const RIVER_THRESHOLD_MIN = 5; // b1 > this triggers expansion
+
+export const RIVER_EXPAND_BASE_RADIUS_M = 800; // starting search radius
+
+export const RIVER_EXPAND_MAX_RADIUS_M = 3000; // cap on expansion
+
+export const RIVER_EXPAND_CANDIDATE_CAP = 6;
+
 /**
  * Max walking distance (meters) for the final walk from alight stop to destination.
  * Candidate alight stops beyond this distance are skipped unless no closer stop exists.
@@ -62,15 +70,28 @@ export const SIMULATION_SPEED_M_PER_TICK =
 export const SYNC_EVERY_N_TICKS = 5;
 
 /**
- * Minimum stop-order gap for same-route walk shortcuts (U-shaped routes).
- * If two stops share a route but are more than this many positions apart,
- * a walk edge is still created so the router can shortcut looping segments.
- */
-export const SAME_ROUTE_SHORTCUT_GAP = 5;
-
-/**
  * TTL (seconds) for the simulation distributed-lock key in Redis.
  * Must be longer than SYNC_EVERY_N_TICKS * TICK_MS so the lock never
  * expires mid-operation on a healthy instance.
  */
 export const SIM_LOCK_TTL_SECONDS = 30;
+// ─── Runtime / Routing config ───────────────────────────────────────────────
+
+/** Network cache TTL in milliseconds (used by TransitRoutingService) */
+export const NETWORK_CACHE_TTL_MS = 5 * 60 * 1000;
+
+/** Search radii steps (meters) used for origin/destination expansion attempts */
+export const ORIGIN_RADII_M = [1000, 2000, 3000, Infinity];
+export const DEST_RADII_M = [1000, 2000, 3000, Infinity];
+
+/** Default RAPTOR max rounds */
+export const RAPTOR_MAX_ROUNDS = 4;
+
+/** Transfer penalty (minutes) used for ranking options (larger than TRANSFER_PENALTY_MIN) */
+export const TRANSFER_PENALTY_FOR_RANKING = 15;
+
+/** Threshold for flagging a long initial walk (meters) */
+export const LONG_WALK_WARNING_M = 1500;
+
+/** Number of top transit options to return for UI */
+export const TOP_TRANSIT_OPTIONS = 5;

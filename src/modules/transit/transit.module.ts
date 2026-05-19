@@ -18,6 +18,7 @@ import { BusLocationService } from './bus-location.service';
 import { TransitRoutingService } from './transit-routing.service';
 import { BusSimulationService } from './bus-simulation.service';
 import { OsrmService } from './osrm.service';
+import { ValhallaService } from './valhalla.service';
 
 @Module({
   imports: [
@@ -40,6 +41,7 @@ import { OsrmService } from './osrm.service';
     TransitRoutingService,
     BusSimulationService,
     OsrmService,
+    ValhallaService,
   ],
   exports: [
     BusRouteService,

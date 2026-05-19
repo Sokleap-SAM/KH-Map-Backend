@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-unused-vars */
 /* eslint-disable @typescript-eslint/no-unsafe-return */
 /* eslint-disable @typescript-eslint/restrict-template-expressions */
 /* eslint-disable @typescript-eslint/no-unnecessary-type-assertion */
@@ -10,15 +11,20 @@ import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { BusRouteStop } from './entities/bus-route-stop.schema';
 import { BusLocationService } from './bus-location.service';
-import { OsrmService } from './osrm.service';
 import {
   WALK_SPEED_KMH,
-  BUS_SIMULATION_SPEED_KMH,
+  BUS_ROUTING_SPEED_KMH,
   TRANSFER_WALK_BASE_RADIUS_M,
   TRANSFER_WALK_RADIUS_GROWTH_PER_ROUND_M,
   TRANSFER_WALK_MAX_RADIUS_M,
   TRANSFER_PENALTY_MIN,
   MIN_WAIT_MIN,
+  NETWORK_CACHE_TTL_MS,
+  ORIGIN_RADII_M,
+  RAPTOR_MAX_ROUNDS,
+  TRANSFER_PENALTY_FOR_RANKING,
+  LONG_WALK_WARNING_M,
+  TOP_TRANSIT_OPTIONS,
 } from '../../shared/constants/constants';
 import {
   Coords,
@@ -26,6 +32,7 @@ import {
   walkMinutes,
   pointToSegmentDistance,
 } from '../../shared/helpers/helper-functions';
+import { ValhallaService } from './valhalla.service';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -38,6 +45,7 @@ interface RouteInfo {
   code?: string | null;
   name?: string | null;
   headwayMinutes?: number | null;
+  isLine?: boolean | null;
 }
 
 interface RouteStop {
@@ -59,20 +67,12 @@ interface BoardEdge {
   hasLiveEta: boolean;
 }
 
-type WalkPair = {
-  segIdx: number;
-  from: Coords;
-  to: Coords;
-  origDist: number;
-};
-
 type RawOption = {
   totalEstimatedMinutes: number;
   totalDistanceMeters: number;
   totalWalkMeters: number;
   transferCount: number;
   segments: any[];
-  walkPairs: WalkPair[];
   fingerprint: string;
   warning?: string;
 };
@@ -121,17 +121,7 @@ function bestDistMeters(stop: RouteStop, prev: RouteStop): number {
 }
 
 function segTime(stop: RouteStop, prev: RouteStop): number {
-  return (bestDistMeters(stop, prev) / 1000 / BUS_SIMULATION_SPEED_KMH) * 60;
-}
-
-function nextBusTime(
-  busEtas: number[],
-  minCatchableTime: number,
-  headwayMinutes: number,
-): number {
-  const catchable = busEtas.find((eta) => eta >= minCatchableTime);
-  if (catchable !== undefined) return catchable;
-  return minCatchableTime + headwayMinutes;
+  return (bestDistMeters(stop, prev) / 1000 / BUS_ROUTING_SPEED_KMH) * 60;
 }
 
 function sumSegmentPathDistance(coords: [number, number][]): number {
@@ -165,13 +155,11 @@ export class TransitRoutingService {
     builtAt: number;
   } | null = null;
 
-  private readonly CACHE_TTL_MS = 5 * 60 * 1000;
-
   constructor(
     @InjectModel(BusRouteStop.name)
     private readonly busRouteStopModel: Model<BusRouteStop>,
     private readonly busLocationService: BusLocationService,
-    private readonly osrmService: OsrmService,
+    private readonly valhallaService: ValhallaService,
   ) {}
 
   invalidateNetworkCache(): void {
@@ -179,11 +167,11 @@ export class TransitRoutingService {
   }
 
   // FIX #1: Coordinate Order Verification
-  // OSRM requires [longitude, latitude]. If values exceed normal ranges, log an error.
+  // Valhalla requires [longitude, latitude]. If values exceed normal ranges, log an error.
   private assertCoords(c: Coords, label: string) {
     if (Math.abs(c[0]) > 180 || Math.abs(c[1]) > 90) {
       this.logger.error(
-        `${label}: suspicious coords [${c}] — may be lat/lng swapped. OSRM expects [longitude, latitude].`,
+        `${label}: suspicious coords [${c}] — may be lat/lng swapped. Valhalla expects [longitude, latitude].`,
       );
     }
   }
@@ -192,7 +180,7 @@ export class TransitRoutingService {
     const now = Date.now();
     if (
       this.networkCache &&
-      now - this.networkCache.builtAt < this.CACHE_TTL_MS
+      now - this.networkCache.builtAt < NETWORK_CACHE_TTL_MS
     ) {
       return this.networkCache;
     }
@@ -363,6 +351,7 @@ export class TransitRoutingService {
           code: route.code,
           name: route.name,
           headwayMinutes: route.headwayMinutes ?? null,
+          isLine: route.isLine ?? true,
         });
       }
 
@@ -386,8 +375,15 @@ export class TransitRoutingService {
       });
     }
 
-    for (const stops of routeStopsMap.values()) {
+    for (const [routeId, stops] of routeStopsMap) {
       stops.sort((a, b) => a.stopOrder - b.stopOrder);
+
+      // For circular routes (isLine === false), append the stop sequence again
+      // so the RAPTOR forward scan can cross the terminal without special-casing.
+      // e.g. [A,B,C,D] → [A,B,C,D,A,B,C,D]; a passenger at D can board toward A.
+      if (routeInfoMap.get(routeId)?.isLine === false) {
+        stops.push(...stops.slice());
+      }
     }
 
     return {
@@ -475,48 +471,138 @@ export class TransitRoutingService {
     return footpaths;
   }
 
-  private getSeedsForRadius(
+  // ─── RIVER FIX: resolveAccessStop uses real Valhalla walk times ───────────
+  // Probes actual pedestrian walk paths for ALL candidate stops within radius,
+  // correctly handling river crossings where the straight-line nearest stop
+  // may be inaccessible and the real best stop is further along the route.
+  //
+  // Candidate strategy by role:
+  //   ORIGIN seeds  — used by RAPTOR to board: ±5 sequence neighbors around
+  //                   haversine-nearest stop. Sequence neighbors matter here
+  //                   because the user boards along the route direction.
+  //   DEST seeds    — used by reconstructRaptorOptions to pick the best alight
+  //                   stop: ALL stops within radius are probed. We cannot rely
+  //                   on sequence proximity because a bridge stop further along
+  //                   the route may have a much shorter real walk to destination
+  //                   than the haversine-nearest stop across the river.
+  private async resolveAccessStop(
+    point: Coords,
     routeStopsMap: Map<string, RouteStop[]>,
-    stopInfoMap: Map<string, StopInfo>,
-    origin: Coords,
-    radiusM: number,
-  ): Set<string> {
-    const seeds = new Set<string>();
+    valhallaWalkCache: Map<
+      string,
+      { path: Coords[]; distanceMeters: number; durationSeconds: number } | null
+    >,
+    maxRadiusM: number,
+    mode: 'origin' | 'destination' = 'origin',
+  ): Promise<Map<string, number>> {
+    const pairKey = (from: Coords, to: Coords) =>
+      `${from[0].toFixed(5)},${from[1].toFixed(5)}→${to[0].toFixed(5)},${to[1].toFixed(5)}`;
 
-    for (const stops of routeStopsMap.values()) {
-      let nearestId: string | null = null;
-      let nearestDist = Infinity;
+    const seeds = new Map<string, number>();
 
-      for (const stop of stops) {
-        const d = haversineMeters(origin, stop.coordinates);
-        if (d < nearestDist) {
-          nearestDist = d;
-          nearestId = stop.stopId;
+    for (const [routeId, stops] of routeStopsMap) {
+      // Pre-filter: skip routes where even the closest stop is beyond radius.
+      // This is a cheap haversine guard — actual walk times come from Valhalla.
+      let minIdx = -1;
+      let minDist = Infinity;
+      for (let i = 0; i < stops.length; i++) {
+        const d = haversineMeters(point, stops[i].coordinates);
+        if (d < minDist) {
+          minDist = d;
+          minIdx = i;
+        }
+      }
+      if (minIdx === -1) continue;
+
+      // Build candidate set depending on mode:
+      const candidateStops = new Map<string, RouteStop>();
+
+      if (mode === 'destination') {
+        // DESTINATION: probe ALL stops on the route — no haversine cutoff.
+        //
+        // Why: the correct alight stop is whichever stop has the shortest REAL
+        // walk to the destination. Near a river, that stop is often a bridge
+        // stop that is far in straight-line distance from the destination
+        // (the river is in the way) but close in actual walking distance via
+        // the bridge. Any haversine radius filter would exclude it before
+        // Valhalla ever gets a chance to evaluate it.
+        //
+        // We rely entirely on Valhalla times + the bestDur+10 threshold to
+        // discard stops that are genuinely too far to walk.
+        for (const stop of stops) {
+          candidateStops.set(stop.stopId, stop);
+        }
+      } else {
+        // ORIGIN: skip route if closest stop is beyond radius (normal filter).
+        if (minDist > maxRadiusM) continue;
+
+        // ±5 sequence neighbors + top-3 by straight line.
+        // For boarding, the user walks to a stop and waits — sequence neighbors
+        // capture stops they could reach along the road in either direction.
+        const sortedByDist = [...stops]
+          .map((s, i) => ({ s, d: haversineMeters(point, s.coordinates), i }))
+          .sort((a, b) => a.d - b.d);
+        for (let i = 0; i < Math.min(3, sortedByDist.length); i++) {
+          candidateStops.set(sortedByDist[i].s.stopId, sortedByDist[i].s);
+        }
+        const start = Math.max(0, minIdx - 5);
+        const end = Math.min(stops.length - 1, minIdx + 5);
+        for (let i = start; i <= end; i++) {
+          candidateStops.set(stops[i].stopId, stops[i]);
         }
       }
 
-      if (nearestId && nearestDist <= radiusM) {
-        seeds.add(nearestId);
+      // Probe real walking times via Valhalla for all candidates in parallel.
+      // Results go into the shared cache to avoid duplicate calls later.
+      const candidates = Array.from(candidateStops.values());
+      const probes = await Promise.all(
+        candidates.map(async (c) => {
+          const key = pairKey(point, c.coordinates);
+          let r = valhallaWalkCache.get(key);
+          if (r === undefined) {
+            r = await this.valhallaService.getWalkPath(point, c.coordinates);
+            valhallaWalkCache.set(key, r);
+          }
+          const fallbackDist = haversineMeters(point, c.coordinates);
+          return {
+            stopId: c.stopId,
+            dur: r
+              ? r.durationSeconds / 60
+              : walkMinutes(fallbackDist, WALK_SPEED_KMH),
+          };
+        }),
+      );
+
+      // Find the fastest REAL walk time among all candidates (Valhalla-based).
+      // This is the ground truth — straight-line distance played no role here.
+      let bestDur = Infinity;
+      for (const p of probes) {
+        if (p.dur < bestDur) bestDur = p.dur;
+      }
+
+      // Seed stops within 10 min of the best real walk time.
+      // For origin: gives RAPTOR flexibility to board at slightly further stops.
+      // For destination: gives reconstructRaptorOptions all viable alight stops
+      // so it picks the one minimising (RAPTOR arrival time + real walk to dest).
+      for (const p of probes) {
+        if (p.dur <= bestDur + 10) {
+          seeds.set(p.stopId, p.dur);
+        }
       }
     }
-
     return seeds;
   }
 
   private runRaptor(
-    origin: Coords,
-    originSeeds: Set<string>,
+    originSeeds: Map<string, number>,
     routeStopsMap: Map<string, RouteStop[]>,
     stopInfoMap: Map<string, StopInfo>,
     routeInfoMap: Map<string, RouteInfo>,
     liveEtaMap: Map<string, Map<string, number[]>>,
     stopRoutes: Map<string, string[]>,
     footpaths: Map<string, Footpath[]>,
-    maxRounds = 4,
-  ): {
-    tau: Map<string, number>[];
-    labels: Map<string, JourneyLabel>[];
-  } {
+    maxRounds = RAPTOR_MAX_ROUNDS,
+  ) {
     const tau: Map<string, number>[] = Array.from(
       { length: maxRounds + 1 },
       () => new Map(),
@@ -526,21 +612,16 @@ export class TransitRoutingService {
       () => new Map(),
     );
     const tauStar = new Map<string, number>();
-
     let markedStops = new Set<string>();
 
-    // Initial walk to stops
-    for (const stopId of originSeeds) {
-      const info = stopInfoMap.get(stopId);
-      if (!info) continue;
-      const d = haversineMeters(origin, info.coordinates);
-      const arrival = walkMinutes(d, WALK_SPEED_KMH);
-      tau[0].set(stopId, arrival);
-      tauStar.set(stopId, arrival);
+    // Seed initial walk arrivals using real Valhalla walk durations
+    for (const [stopId, walkTime] of originSeeds) {
+      tau[0].set(stopId, walkTime);
+      tauStar.set(stopId, walkTime);
       labels[0].set(stopId, {
         type: 'walk',
         fromStopId: '__ORIGIN__',
-        distMeters: d,
+        distMeters: walkTime * (WALK_SPEED_KMH / 60) * 1000,
       });
       markedStops.add(stopId);
     }
@@ -574,7 +655,32 @@ export class TransitRoutingService {
         for (let i = startIndex; i < stops.length; i++) {
           const current = stops[i];
 
-          if (boardedAtIndex !== -1) {
+          // Step 1 — boarding check (standard RAPTOR order: before propagation).
+          // Allows re-boarding at a later stop when an earlier bus is available
+          // there (multi-vehicle routes). Because this runs before propagation,
+          // the boarding stop itself is never incorrectly written to tauStar.
+          const arrivalPrevRound =
+            tau[round - 1].get(current.stopId) ?? Infinity;
+          if (isFinite(arrivalPrevRound)) {
+            const minCatchable = arrivalPrevRound + MIN_WAIT_MIN;
+            const busEtas = liveEtaMap.get(routeId)?.get(current.stopId) ?? [];
+            const headway = routeInfoMap.get(routeId)?.headwayMinutes ?? 30;
+            const catchable = busEtas.find((eta) => eta >= minCatchable);
+            const candidateTime = catchable ?? minCatchable + headway;
+
+            if (boardedAtIndex === -1 || candidateTime < boardTime) {
+              boardedAtIndex = i;
+              boardedAtStopId = current.stopId;
+              boardTime = candidateTime;
+              boardHasLiveEta = catchable !== undefined;
+              rideMinutesFromBoard = 0;
+            }
+          }
+
+          // Step 2 — propagate to stops strictly after the boarding stop.
+          // Skipping i === boardedAtIndex avoids writing a stale arrival at the
+          // boarding stop (its correct arrival is already in tau[round-1]).
+          if (boardedAtIndex !== -1 && i > boardedAtIndex) {
             rideMinutesFromBoard += segTime(stops[i], stops[i - 1]);
             const arrivalOnBus = boardTime + rideMinutesFromBoard;
 
@@ -590,25 +696,6 @@ export class TransitRoutingService {
                 hasLiveEta: boardHasLiveEta,
               });
               newlyImproved.add(current.stopId);
-            }
-          }
-
-          const arrivalPrevRound =
-            tau[round - 1].get(current.stopId) ?? Infinity;
-          if (isFinite(arrivalPrevRound)) {
-            const minCatchable = arrivalPrevRound + MIN_WAIT_MIN;
-            const busEtas = liveEtaMap.get(routeId)?.get(current.stopId) ?? [];
-            const headway = routeInfoMap.get(routeId)?.headwayMinutes ?? 30;
-            const catchable = busEtas.find((eta) => eta >= minCatchable);
-            const candidateTime = catchable ?? minCatchable + headway;
-
-            // FIX #4: Compare only boarding times (find earliest possible board)
-            if (boardedAtIndex === -1 || candidateTime < boardTime) {
-              boardedAtIndex = i;
-              boardedAtStopId = current.stopId;
-              boardTime = candidateTime;
-              boardHasLiveEta = catchable !== undefined;
-              rideMinutesFromBoard = 0;
             }
           }
         }
@@ -657,7 +744,11 @@ export class TransitRoutingService {
   ): { [key: string]: unknown } | null {
     const routeStops = routeStopsMap.get(routeId) ?? [];
     const boardIdx = routeStops.findIndex((s) => s.stopId === boardedAtStopId);
-    const alightIdx = routeStops.findIndex((s) => s.stopId === alightStopId);
+    // Search for alight stop strictly after board position — handles circular
+    // routes where the same stopId appears twice in the (doubled) array.
+    const alightIdx = routeStops.findIndex(
+      (s, i) => i > boardIdx && s.stopId === alightStopId,
+    );
     if (boardIdx < 0 || alightIdx <= boardIdx) return null;
 
     const boardStop = stopInfoMap.get(boardedAtStopId);
@@ -729,7 +820,7 @@ export class TransitRoutingService {
     };
   }
 
-  private reconstructRaptorOptions(
+  private async reconstructRaptorOptions(
     round: number,
     tau: Map<string, number>[],
     labels: Map<string, JourneyLabel>[],
@@ -739,25 +830,47 @@ export class TransitRoutingService {
     routeInfoMap: Map<string, RouteInfo>,
     routeStopsMap: Map<string, RouteStop[]>,
     liveEtaMap: Map<string, Map<string, number[]>>,
-    destRadiusM: number,
+    // destSeeds: real Valhalla walk times from each reachable stop → destination.
+    // Stops absent from this map are unreachable on foot (e.g. across a river
+    // with no bridge nearby), so they are simply skipped as alight candidates.
+    destSeeds: Map<string, number>,
+    // valhallaWalkCache: shared cache of Valhalla results keyed by pairKey,
+    // populated by resolveAccessStop. Re-used here to avoid duplicate calls.
+    valhallaWalkCache: Map<
+      string,
+      { path: Coords[]; distanceMeters: number; durationSeconds: number } | null
+    >,
     topK = 3,
-  ): RawOption[] {
+  ): Promise<RawOption[]> {
     const roundLabels = labels[round];
     if (!roundLabels || roundLabels.size === 0) return [];
 
-    type Candidate = { stopId: string; total: number; dist: number };
+    type Candidate = { stopId: string; total: number; walkMinutes: number };
     const candidates: Candidate[] = [];
 
     for (const stopId of roundLabels.keys()) {
+      const label = roundLabels.get(stopId)!;
+
+      // Only consider stops reached by a transit (bus) leg as alight candidates.
+      // Stops reached via a footpath walk label are intermediate transfer points —
+      // RAPTOR wrote them so the next round can board a connecting route from there.
+      // If we used them as alight candidates, reconstruction would emit the footpath
+      // as a separate walk segment AND then add the destination walk on top, producing
+      // two consecutive walks after alighting. The real walk from the bus stop all the
+      // way to the destination is already captured by destSeeds (Valhalla computed it
+      // from the transit stop directly), so we skip footpath-reached stops entirely.
+      if (label.type !== 'transit') continue;
+
       const arrivalAtStop = tau[round].get(stopId) ?? Infinity;
-      const stopInfo = stopInfoMap.get(stopId);
-      if (!isFinite(arrivalAtStop) || !stopInfo) continue;
+      const walkToDest = destSeeds.get(stopId); // Real Valhalla walk time
 
-      const distToDest = haversineMeters(stopInfo.coordinates, destination);
-      if (distToDest > destRadiusM) continue;
+      if (!isFinite(arrivalAtStop) || walkToDest === undefined) continue;
 
-      const total = arrivalAtStop + walkMinutes(distToDest, WALK_SPEED_KMH);
-      candidates.push({ stopId, total, dist: distToDest });
+      candidates.push({
+        stopId,
+        total: arrivalAtStop + walkToDest,
+        walkMinutes: walkToDest,
+      });
     }
 
     candidates.sort((a, b) => a.total - b.total);
@@ -766,9 +879,10 @@ export class TransitRoutingService {
     const dedupedOptions: RawOption[] = [];
 
     for (const candidate of candidates) {
-      const option = this.reconstructFromAlightStop(
+      const option = await this.reconstructFromAlightStop(
         candidate.stopId,
         candidate.total,
+        candidate.walkMinutes,
         round,
         tau,
         labels,
@@ -778,6 +892,7 @@ export class TransitRoutingService {
         routeInfoMap,
         routeStopsMap,
         liveEtaMap,
+        valhallaWalkCache,
       );
       if (option && !seenJourneyKey.has(option.fingerprint)) {
         seenJourneyKey.add(option.fingerprint);
@@ -787,9 +902,10 @@ export class TransitRoutingService {
     return dedupedOptions.slice(0, topK);
   }
 
-  private reconstructFromAlightStop(
+  private async reconstructFromAlightStop(
     bestStopId: string,
     bestTotal: number,
+    destWalkMinutes: number, // Real Valhalla walk time from bestStopId → destination
     round: number,
     tau: Map<string, number>[],
     labels: Map<string, JourneyLabel>[],
@@ -799,7 +915,25 @@ export class TransitRoutingService {
     routeInfoMap: Map<string, RouteInfo>,
     routeStopsMap: Map<string, RouteStop[]>,
     liveEtaMap: Map<string, Map<string, number[]>>,
-  ): RawOption | null {
+    valhallaWalkCache: Map<
+      string,
+      { path: Coords[]; distanceMeters: number; durationSeconds: number } | null
+    >,
+  ): Promise<RawOption | null> {
+    // Helper: get a Valhalla walk result, using the shared cache to avoid duplicate calls.
+    const pairKey = (from: Coords, to: Coords) =>
+      `${from[0].toFixed(5)},${from[1].toFixed(5)}→${to[0].toFixed(5)},${to[1].toFixed(5)}`;
+
+    const getWalk = async (from: Coords, to: Coords) => {
+      const key = pairKey(from, to);
+      if (valhallaWalkCache.has(key)) return valhallaWalkCache.get(key)!;
+      this.assertCoords(from, 'reconstructFromAlightStop: from');
+      this.assertCoords(to, 'reconstructFromAlightStop: to');
+      const result = await this.valhallaService.getWalkPath(from, to);
+      valhallaWalkCache.set(key, result);
+      return result;
+    };
+
     const segmentsRev: any[] = [];
     let currentStopId = bestStopId;
     let currentRound = round;
@@ -807,7 +941,6 @@ export class TransitRoutingService {
 
     let lastBusRouteId: string | null = null;
     let busSegmentCount = 0;
-    let lastBusAlightStopId: string | null = null;
 
     while (currentRound >= 0) {
       if (visited.has(`${currentRound}:${currentStopId}`)) break;
@@ -820,14 +953,20 @@ export class TransitRoutingService {
         if (label.fromStopId === '__ORIGIN__') {
           const toStop = stopInfoMap.get(currentStopId);
           if (!toStop) return null;
+          // Use real Valhalla path for origin → first stop walk
+          const walk = await getWalk(origin, toStop.coordinates);
+          const distMeters =
+            walk?.distanceMeters ?? haversineMeters(origin, toStop.coordinates);
+          const estMinutes = walk
+            ? Math.round(walk.durationSeconds / 60) || 1
+            : Math.round(walkMinutes(distMeters, WALK_SPEED_KMH)) || 1;
           segmentsRev.push({
             type: 'walk',
             from: { name: 'Your Location', coordinates: origin },
             to: { name: toStop.name, coordinates: toStop.coordinates },
-            path: [origin, toStop.coordinates] as Coords[],
-            distanceMeters: Math.round(label.distMeters),
-            estimatedMinutes:
-              Math.round(walkMinutes(label.distMeters, WALK_SPEED_KMH)) || 1,
+            path: walk?.path ?? [origin, toStop.coordinates],
+            distanceMeters: Math.round(distMeters),
+            estimatedMinutes: estMinutes,
             isTransfer: false,
           });
           break;
@@ -838,14 +977,22 @@ export class TransitRoutingService {
         const toStop = stopInfoMap.get(currentStopId);
         if (!fromStop || !toStop) return null;
 
+        // Use real Valhalla path for transfer walk between stops
+        const walk = await getWalk(fromStop.coordinates, toStop.coordinates);
+        const distMeters =
+          walk?.distanceMeters ??
+          haversineMeters(fromStop.coordinates, toStop.coordinates);
+        const estMinutes = walk
+          ? Math.round(walk.durationSeconds / 60) || 1
+          : Math.round(walkMinutes(distMeters, WALK_SPEED_KMH)) || 1;
+
         segmentsRev.push({
           type: 'walk',
           from: { name: fromStop.name, coordinates: fromStop.coordinates },
           to: { name: toStop.name, coordinates: toStop.coordinates },
-          path: [fromStop.coordinates, toStop.coordinates] as Coords[],
-          distanceMeters: Math.round(label.distMeters),
-          estimatedMinutes:
-            Math.round(walkMinutes(label.distMeters, WALK_SPEED_KMH)) || 1,
+          path: walk?.path ?? [fromStop.coordinates, toStop.coordinates],
+          distanceMeters: Math.round(distMeters),
+          estimatedMinutes: estMinutes,
           isTransfer: isActualTransfer,
         });
 
@@ -880,46 +1027,55 @@ export class TransitRoutingService {
 
       segmentsRev.push(busSegment);
 
-      lastBusAlightStopId ??= currentStopId; // ✅ only set on the FIRST bus seen (= last bus forward)
       lastBusRouteId = label.routeId;
       currentStopId = label.boardedAtStopId;
       currentRound -= 1;
     }
 
-    const dropOffStopId = lastBusAlightStopId ?? bestStopId;
-    const lastTransitStop = stopInfoMap.get(dropOffStopId);
-    if (!lastTransitStop) return null;
+    // bestStopId is the stop RAPTOR resolved as nearest to the destination
+    // (selected via destSeeds in reconstructRaptorOptions). destWalkMinutes is
+    // the real Valhalla walk time FROM bestStopId → destination.
+    //
+    // During reverse traversal above, any footpath walk labels between the bus
+    // alight stop and bestStopId were already added as transfer walk segments.
+    // We must NOT add another walk from lastBusAlightStopId → destination, as
+    // that would duplicate those footpath segments. Instead, always build the
+    // final destination walk FROM bestStopId, which is exactly what destSeeds
+    // was computed for.
+    const destStop = stopInfoMap.get(bestStopId);
+    if (!destStop) return null;
 
-    const destDist = haversineMeters(lastTransitStop.coordinates, destination);
+    // Use real Valhalla path for bestStopId → destination walk.
+    // This result is already cached from the destSeeds resolution pass.
+    const destWalk = await getWalk(destStop.coordinates, destination);
+    const destDistMeters =
+      destWalk?.distanceMeters ??
+      haversineMeters(destStop.coordinates, destination);
+    const destEstMinutes = destWalk
+      ? Math.round(destWalk.durationSeconds / 60) || 1
+      : Math.round(destWalkMinutes) || 1;
+
     segmentsRev.unshift({
       type: 'walk',
       from: {
-        name: lastTransitStop.name,
-        coordinates: lastTransitStop.coordinates,
+        name: destStop.name,
+        coordinates: destStop.coordinates,
       },
       to: { name: 'Destination', coordinates: destination },
-      path: [lastTransitStop.coordinates, destination] as Coords[],
-      distanceMeters: Math.round(destDist),
-      estimatedMinutes: Math.round(walkMinutes(destDist, WALK_SPEED_KMH)) || 1,
+      path: destWalk?.path ?? [destStop.coordinates, destination],
+      distanceMeters: Math.round(destDistMeters),
+      estimatedMinutes: destEstMinutes,
       isTransfer: false,
     });
 
     const segments = segmentsRev.reverse();
     let totalDistanceMeters = 0;
     let totalWalkMeters = 0;
-    const walkPairs: WalkPair[] = [];
 
-    for (let i = 0; i < segments.length; i++) {
-      const seg = segments[i] as any;
+    for (const seg of segments as any[]) {
       if (seg.type === 'walk') {
         totalDistanceMeters += seg.distanceMeters as number;
         totalWalkMeters += seg.distanceMeters as number;
-        walkPairs.push({
-          segIdx: i,
-          from: seg.from.coordinates as Coords,
-          to: seg.to.coordinates as Coords,
-          origDist: seg.distanceMeters as number,
-        });
       }
       if (seg.type === 'bus') {
         totalDistanceMeters += seg.distanceMeters as number;
@@ -939,92 +1095,63 @@ export class TransitRoutingService {
       totalWalkMeters: Math.round(totalWalkMeters),
       transferCount: finalTransferCount,
       segments,
-      walkPairs,
       fingerprint: fingerprint || `walk:${Math.round(totalWalkMeters)}`,
     };
   }
 
-  private async enrichWalkSegmentsWithOsrm(
-    rawOptions: RawOption[],
-  ): Promise<void> {
-    const pairKey = (from: Coords, to: Coords) =>
-      `${from[0].toFixed(5)},${from[1].toFixed(5)}→${to[0].toFixed(5)},${to[1].toFixed(5)}`;
-
-    const uniquePairs = new Map<string, { from: Coords; to: Coords }>();
-    for (const opt of rawOptions) {
-      for (const wp of opt.walkPairs) {
-        uniquePairs.set(pairKey(wp.from, wp.to), { from: wp.from, to: wp.to });
-      }
-    }
-
-    const osrmCache = new Map<
-      string,
-      { path: Coords[]; distanceMeters: number; durationSeconds: number } | null
-    >();
-
-    // FIX: Process sequentially using for...of instead of Promise.all
-    // This stops us from hitting the public OSRM server with 15 requests
-    // simultaneously, which was causing the silent 429 Rate Limit failures.
-    for (const [key, pair] of uniquePairs.entries()) {
-      this.assertCoords(pair.from, 'enrichWalkSegmentsWithOsrm: from');
-      this.assertCoords(pair.to, 'enrichWalkSegmentsWithOsrm: to');
-
-      // (We no longer need snapCoord fallback because OsrmService handles truncation)
-      const result = await this.osrmService.getWalkPath(pair.from, pair.to);
-      osrmCache.set(key, result);
-
-      // Optional: Add a tiny 50ms delay between requests to be extra safe with the demo server
-      if (uniquePairs.size > 2) {
-        await new Promise((r) => setTimeout(r, 50));
-      }
-    }
-
-    for (const opt of rawOptions) {
-      for (const wp of opt.walkPairs) {
-        const result = osrmCache.get(pairKey(wp.from, wp.to));
-        const seg = opt.segments[wp.segIdx] as any;
-        if (result) {
-          opt.totalDistanceMeters =
-            opt.totalDistanceMeters - wp.origDist + result.distanceMeters;
-          opt.totalWalkMeters =
-            opt.totalWalkMeters - wp.origDist + result.distanceMeters;
-          seg.path = result.path;
-          seg.distanceMeters = Math.round(result.distanceMeters);
-          seg.estimatedMinutes = Math.round(result.durationSeconds / 60) || 1;
-        } else {
-          seg.isApproximate = true;
-        }
-      }
-    }
-  }
-
+  // Re-evaluate every bus leg's catchability using the final (Valhalla-enriched)
+  // walk times. RAPTOR used approximate seed times; this is the authoritative pass.
+  // We walk segments in order, accumulate the true elapsed user time to each
+  // boarding stop, then pick the first live ETA >= (arrival + MIN_WAIT_MIN).
+  // If no live ETA qualifies (bus already gone), fall back to scheduled headway
+  // from the user's earliest possible board time.
   private recheckBusCatchability(rawOptions: RawOption[]): void {
     for (const opt of rawOptions) {
-      let cumulativeMinutes = 0;
+      let cumulativeMinutes = 0; // real elapsed time for the user up to each point
       let totalRecalc = 0;
+
       for (const seg of opt.segments as any[]) {
         if (seg.type === 'walk') {
           cumulativeMinutes += seg.estimatedMinutes as number;
           totalRecalc += seg.estimatedMinutes as number;
-        } else if (seg.type === 'bus') {
+          continue;
+        }
+
+        if (seg.type === 'bus') {
           const boardEdge = seg._boardEdge as BoardEdge | undefined;
           if (boardEdge) {
-            const minCatchable = cumulativeMinutes + MIN_WAIT_MIN;
+            // Earliest the user can board: must have walked to stop + MIN_WAIT_MIN buffer.
+            // Any live ETA before this threshold is already missed — skip it.
+            const earliestBoard = cumulativeMinutes + MIN_WAIT_MIN;
             const hw = boardEdge.headwayMinutes ?? 30;
-            const boardTime = nextBusTime(boardEdge.busEtas, minCatchable, hw);
+
+            // Find the first live ETA the user can actually catch.
+            const catchableEta = boardEdge.busEtas.find(
+              (eta) => eta >= earliestBoard,
+            );
+
+            // If no live ETA is catchable, use headway FROM earliestBoard —
+            // NOT minCatchable + headway, which would double-count the wait.
+            const boardTime = catchableEta ?? earliestBoard + hw;
+
             seg.waitMinutes = Math.round(
               Math.max(0, boardTime - cumulativeMinutes),
             );
-            seg.totalLegMinutes = seg.waitMinutes + (seg.rideMinutes as number);
-            seg.hasLiveEta =
-              boardEdge.hasLiveEta &&
-              boardEdge.busEtas.some((eta) => eta >= minCatchable);
+            seg.totalLegMinutes =
+              (seg.waitMinutes as number) + (seg.rideMinutes as number);
+            // Only mark as live if a real ETA was catchable
+            seg.hasLiveEta = catchableEta !== undefined;
+
+            // Expose ETAs for client display, remove internal edge
+            seg.busEtas = boardEdge.busEtas;
             delete seg._boardEdge;
           }
+
           cumulativeMinutes += seg.totalLegMinutes as number;
           totalRecalc += seg.totalLegMinutes as number;
         }
       }
+
       opt.totalEstimatedMinutes = Math.round(totalRecalc);
     }
   }
@@ -1032,7 +1159,10 @@ export class TransitRoutingService {
   private addLongWalkMetadata(options: RawOption[]) {
     for (const opt of options) {
       const firstLeg = opt.segments[0] as any;
-      if (firstLeg?.type === 'walk' && firstLeg.distanceMeters > 1500) {
+      if (
+        firstLeg?.type === 'walk' &&
+        firstLeg.distanceMeters > LONG_WALK_WARNING_M
+      ) {
         opt.warning =
           'Note: This route requires a significant walk to the first stop.';
       }
@@ -1042,18 +1172,22 @@ export class TransitRoutingService {
   private assignTransitLabel(
     idx: number,
     deltaMinutes: number,
+    fastestMinutes: number,
   ): TransitPositionMeta {
     if (idx === 0) return { type: 'fastest', label: 'Fastest' };
-    if (deltaMinutes <= 5) return { type: 'fast', label: 'Fast' };
-    if (deltaMinutes <= 15) return { type: 'average', label: 'Average' };
-    if (deltaMinutes <= 30) return { type: 'slower', label: 'Slower' };
+    // Use percentage of the fastest time so thresholds scale with journey length.
+    const pct =
+      fastestMinutes > 0 ? (deltaMinutes / fastestMinutes) * 100 : 100;
+    if (pct <= 10) return { type: 'fast', label: 'Fast' };
+    if (pct <= 25) return { type: 'average', label: 'Average' };
+    if (pct <= 50) return { type: 'slower', label: 'Slower' };
     return { type: 'slowest', label: 'Slowest' };
   }
 
   private mapTransitSuccessResponse(rawOptions: RawOption[]) {
-    const TRANSFER_PENALTY_FOR_RANKING = 15;
-
-    const sorted = [...rawOptions].sort((a, b) => {
+    // Rank by score (time + transfer penalty) to select the top-K options,
+    // preferring direct routes over transfers of similar duration.
+    const ranked = [...rawOptions].sort((a, b) => {
       const aScore =
         a.totalEstimatedMinutes +
         a.transferCount * TRANSFER_PENALTY_FOR_RANKING;
@@ -1063,21 +1197,26 @@ export class TransitRoutingService {
       return aScore - bScore;
     });
 
-    const topOptions = sorted.slice(0, 5);
+    const topOptions = ranked.slice(0, TOP_TRANSIT_OPTIONS);
     if (topOptions.length === 0) {
       return { found: false as const, type: 'transit' as const, options: [] };
     }
 
-    const fastestTime = topOptions[0].totalEstimatedMinutes;
+    // Re-sort by actual travel time so the user always sees fastest first.
+    const display = [...topOptions].sort(
+      (a, b) => a.totalEstimatedMinutes - b.totalEstimatedMinutes,
+    );
+
+    const fastestTime = display[0].totalEstimatedMinutes;
 
     return {
       found: true as const,
       type: 'transit' as const,
-      options: topOptions.map((o, idx) => {
-        // Compute how this option compares to the very best option dynamically
+      options: display.map((o, idx) => {
         const meta = this.assignTransitLabel(
           idx,
           o.totalEstimatedMinutes - fastestTime,
+          fastestTime,
         );
 
         return {
@@ -1104,16 +1243,18 @@ export class TransitRoutingService {
   }
 
   private async planWalkRoute(origin: Coords, destination: Coords) {
-    // Guard checks injected here before calling OSRM via planWalkRoute
     this.assertCoords(origin, 'planWalkRoute: origin');
     this.assertCoords(destination, 'planWalkRoute: destination');
 
     const directWalkDist = haversineMeters(origin, destination);
-    const osrmResult = await this.osrmService.getWalkPath(origin, destination);
-    const path: Coords[] = osrmResult?.path ?? [origin, destination];
-    const distanceMeters = osrmResult?.distanceMeters ?? directWalkDist;
-    const estimatedMinutes = osrmResult
-      ? Math.round(osrmResult.durationSeconds / 60) || 1
+    const valhallaResult = await this.valhallaService.getWalkPath(
+      origin,
+      destination,
+    );
+    const path: Coords[] = valhallaResult?.path ?? [origin, destination];
+    const distanceMeters = valhallaResult?.distanceMeters ?? directWalkDist;
+    const estimatedMinutes = valhallaResult
+      ? Math.round(valhallaResult.durationSeconds / 60) || 1
       : Math.round(walkMinutes(directWalkDist, WALK_SPEED_KMH));
 
     return {
@@ -1143,38 +1284,68 @@ export class TransitRoutingService {
   }
 
   private async planTransitRoute(origin: Coords, destination: Coords) {
-    // Guard checks injected here at the beginning of the transit flow
     this.assertCoords(origin, 'planTransitRoute: origin');
     this.assertCoords(destination, 'planTransitRoute: destination');
 
     const network = await this.getNetwork();
-    if (network.validStopsCount === 0 || network.routeStopsMap.size === 0)
-      return this.planWalkRoute(origin, destination);
+    if (network.validStopsCount === 0 || network.routeStopsMap.size === 0) {
+      this.logger.warn(
+        '[planTransitRoute] No stops in network, cannot find transit route',
+      );
+      return { found: false as const, type: 'transit' as const, options: [] };
+    }
 
     const liveEtaMap = await this.computeLiveEtaMap(network.routeStopsMap);
 
-    const ORIGIN_RADII = [1000, 2000, 3000, Infinity];
-    const DEST_RADII = [1000, 2000, 3000, Infinity];
+    // Shared Valhalla cache: reused across all attempts and reconstruction
+    // so we never call Valhalla twice for the same coordinate pair.
+    const valhallaWalkCache = new Map<
+      string,
+      { path: Coords[]; distanceMeters: number; durationSeconds: number } | null
+    >();
 
-    for (let attempt = 0; attempt < ORIGIN_RADII.length; attempt++) {
-      const originRadiusM = ORIGIN_RADII[attempt];
-      const destRadiusM = DEST_RADII[attempt];
+    // Destination seeds are computed once — destination mode probes every stop
+    // on each route regardless of radius, so recomputing per attempt is redundant.
+    const destSeeds = await this.resolveAccessStop(
+      destination,
+      network.routeStopsMap,
+      valhallaWalkCache,
+      Infinity,
+      'destination',
+    );
+    if (destSeeds.size === 0) {
+      this.logger.warn(
+        '[planTransitRoute] No destination stops reachable via Valhalla',
+      );
+      return { found: false as const, type: 'transit' as const, options: [] };
+    }
 
+    // Expand search radius each attempt until a valid transit route is found.
+    // We never fall back to a walk plan — the caller requested transit, so we
+    // keep widening until ORIGIN_RADII_M is exhausted, then return found:false
+    // so the frontend can decide what to show (e.g. "no routes found nearby").
+    for (let attempt = 0; attempt < ORIGIN_RADII_M.length; attempt++) {
+      const radiusM = ORIGIN_RADII_M[attempt];
       this.logger.debug(
-        `[planTransitRoute] attempt=${attempt + 1} ` +
-          `originRadius=${originRadiusM}m destRadius=${destRadiusM}m`,
+        `[planTransitRoute] attempt=${attempt + 1}/${ORIGIN_RADII_M.length} radius=${radiusM}m`,
       );
 
-      const originSeeds = this.getSeedsForRadius(
+      const originSeeds = await this.resolveAccessStop(
+        origin,
         network.routeStopsMap,
-        network.stopInfoMap,
-        origin,
-        originRadiusM,
+        valhallaWalkCache,
+        radiusM,
+        'origin',
       );
 
-      const maxRounds = 4;
+      if (originSeeds.size === 0) {
+        this.logger.debug(
+          `[planTransitRoute] attempt=${attempt + 1} originSeeds=0 — expanding radius`,
+        );
+        continue;
+      }
+
       const { tau, labels } = this.runRaptor(
-        origin,
         originSeeds,
         network.routeStopsMap,
         network.stopInfoMap,
@@ -1182,35 +1353,34 @@ export class TransitRoutingService {
         liveEtaMap,
         network.stopRoutes,
         network.footpaths,
-        maxRounds,
+        RAPTOR_MAX_ROUNDS,
       );
 
       const rawOptions: RawOption[] = [];
-      for (let round = 1; round <= maxRounds; round++) {
-        rawOptions.push(
-          ...this.reconstructRaptorOptions(
-            round,
-            tau,
-            labels,
-            origin,
-            destination,
-            network.stopInfoMap,
-            network.routeInfoMap,
-            network.routeStopsMap,
-            liveEtaMap,
-            destRadiusM,
-          ),
+      for (let round = 1; round <= RAPTOR_MAX_ROUNDS; round++) {
+        const opts = await this.reconstructRaptorOptions(
+          round,
+          tau,
+          labels,
+          origin,
+          destination,
+          network.stopInfoMap,
+          network.routeInfoMap,
+          network.routeStopsMap,
+          liveEtaMap,
+          destSeeds,
+          valhallaWalkCache,
         );
+        rawOptions.push(...opts);
       }
 
       if (rawOptions.length === 0) {
         this.logger.debug(
-          `[planTransitRoute] attempt=${attempt + 1} rawOptions=0, expanding...`,
+          `[planTransitRoute] attempt=${attempt + 1} rawOptions=0 — expanding radius`,
         );
         continue;
       }
 
-      await this.enrichWalkSegmentsWithOsrm(rawOptions);
       this.recheckBusCatchability(rawOptions);
 
       const seen = new Set<string>();
@@ -1224,18 +1394,24 @@ export class TransitRoutingService {
 
       if (finalOptions.length === 0) {
         this.logger.debug(
-          `[planTransitRoute] attempt=${attempt + 1} finalOptions=0 after filter, expanding...`,
+          `[planTransitRoute] attempt=${attempt + 1} no valid bus options after filter — expanding radius`,
         );
         continue;
       }
 
+      this.logger.debug(
+        `[planTransitRoute] found ${finalOptions.length} option(s) at attempt=${attempt + 1} radius=${radiusM}m`,
+      );
       this.addLongWalkMetadata(finalOptions);
       return this.mapTransitSuccessResponse(finalOptions);
     }
 
+    // All radii exhausted — no transit route reachable. Return found:false so
+    // the frontend can handle this case (e.g. show "no nearby stops" message).
+    // Never return a walk plan here: the user explicitly requested transit.
     this.logger.warn(
-      '[planTransitRoute] All expansion attempts exhausted, falling back to walk',
+      `[planTransitRoute] All ${ORIGIN_RADII_M.length} radius attempts exhausted — no transit route found`,
     );
-    return this.planWalkRoute(origin, destination);
+    return { found: false as const, type: 'transit' as const, options: [] };
   }
 }
