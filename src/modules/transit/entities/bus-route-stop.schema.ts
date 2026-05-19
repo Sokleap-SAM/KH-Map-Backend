@@ -24,10 +24,14 @@ export class BusRouteStop extends BaseEntity {
   distanceFromPrevious?: number | null;
 
   /**
-   * Road geometry from this stop to the next stop in the route sequence.
-   * Use multiple coordinates to trace curves/turns along the actual road.
-   * First coordinate should be at this stop's location; last at the next stop.
-   * Null for the last stop (no next segment).
+   * Road geometry of the segment ARRIVING at this stop — the path from the
+   * previous stop in the route sequence to this one. Use multiple coordinates
+   * to trace curves/turns along the actual road. First coordinate should be at
+   * the previous stop's location; last coordinate at this stop's location.
+   * Null for the first stop in a route (no incoming segment).
+   *
+   * Both TransitRoutingService (`buildRaptorBusSegment`) and BusSimulationService
+   * (`buildSegmentCoords`) read this convention — keep them aligned if changed.
    */
   @Prop(
     raw({

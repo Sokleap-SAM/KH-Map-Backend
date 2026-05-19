@@ -51,6 +51,17 @@ export const TRANSFER_PENALTY_MIN = 2;
  */
 export const MIN_WAIT_MIN = 1;
 
+/**
+ * Extra catchability buffer applied ONLY at transfer boardings (round > 1).
+ * The user's arrival at a transfer stop has compounded uncertainty (ride time
+ * variation + walk pace + dwell), so we refuse to commit to a live ETA that is
+ * only marginally catchable. Live ETAs more than this many minutes past
+ * `arrival + MIN_WAIT_MIN` are still accepted; closer ones are treated as missed
+ * and we project the next lap. Does NOT apply to the first boarding from origin,
+ * where the user controls their start time precisely.
+ */
+export const TRANSFER_UNCERTAINTY_BUFFER_MIN = 5;
+
 /** Dwell time (minutes) added per stop for boarding/alighting delay (25 s) */
 export const DWELL_TIME_MIN = 25 / 60;
 
@@ -79,6 +90,20 @@ export const SIM_LOCK_TTL_SECONDS = 30;
 
 /** Network cache TTL in milliseconds (used by TransitRoutingService) */
 export const NETWORK_CACHE_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * Live ETA cache TTL in milliseconds. Multiple plan requests within this window
+ * reuse the same snapshot of bus positions, so plans don't jitter second-by-second
+ * as the simulation ticks. Short enough that live data stays fresh.
+ */
+export const LIVE_ETA_CACHE_TTL_MS = 15 * 1000;
+
+/**
+ * When two alight candidates have totals within this many minutes of each other,
+ * prefer the one with fewer total bus-ride minutes. This biases toward
+ * geographically direct transfers when timing is approximately equal.
+ */
+export const TIE_DELTA_MIN = 2;
 
 /** Search radii steps (meters) used for origin/destination expansion attempts */
 export const ORIGIN_RADII_M = [1000, 2000, 3000, Infinity];

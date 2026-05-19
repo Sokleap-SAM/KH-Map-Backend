@@ -524,8 +524,10 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
    * Uses the stored road geometry (`segmentPath`) if available; falls back to
    * a straight two-point line.
    *
-   * Note: segmentPath at stop i represents the path FROM stop i TO stop i+1.
-   * To reach stops[nextStopIdx], we read the segment from stops[nextStopIdx-1].
+   * Data convention (matches what `TransitRoutingService.buildRaptorBusSegment`
+   * assumes): `stops[i].segmentPath` is the road geometry from stop `i-1` to
+   * stop `i` — the segment ARRIVING at this stop. To travel from the current
+   * stop to `nextStopIdx`, we therefore read `stops[nextStopIdx].segmentPath`.
    */
   private buildSegmentCoords(
     stops: BusRouteStop[],
@@ -534,9 +536,7 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
   ): Coords[] {
     if (nextStopIdx >= stops.length) return [currentPos];
 
-    const currentStopIdx = nextStopIdx - 1;
-    const seg =
-      currentStopIdx >= 0 ? stops[currentStopIdx].segmentPath : undefined;
+    const seg = stops[nextStopIdx].segmentPath;
     if (seg?.coordinates && seg.coordinates.length >= 2) {
       return seg.coordinates as unknown as Coords[];
     }

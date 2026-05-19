@@ -19,10 +19,13 @@ import {
   TRANSFER_WALK_MAX_RADIUS_M,
   TRANSFER_PENALTY_MIN,
   MIN_WAIT_MIN,
+  TRANSFER_UNCERTAINTY_BUFFER_MIN,
   NETWORK_CACHE_TTL_MS,
+  LIVE_ETA_CACHE_TTL_MS,
   ORIGIN_RADII_M,
   RAPTOR_MAX_ROUNDS,
   TRANSFER_PENALTY_FOR_RANKING,
+  TIE_DELTA_MIN,
   LONG_WALK_WARNING_M,
   TOP_TRANSIT_OPTIONS,
 } from '../../shared/constants/constants';
@@ -139,6 +142,60 @@ function transferRadiusForRound(round: number): number {
   return Math.min(TRANSFER_WALK_MAX_RADIUS_M, radius);
 }
 
+// Decide when the user actually boards. Tries each live bus ETA in order; if
+// every visible bus is already past `earliestBoard` (i.e. the user can't catch
+// any of them), projects forward by `headway` minutes — modelling the next lap
+// after the bus respawns at the start of the route. Repeats the +headway step
+// until the projected arrival is catchable, so very long walks still land on a
+// real future arrival rather than something in the past.
+function pickBoardTime(
+  busEtas: number[],
+  headwayMinutes: number,
+  earliestBoardMinutes: number,
+): { boardTime: number; hasLiveEta: boolean } {
+  const catchable = busEtas.find((eta) => eta >= earliestBoardMinutes);
+  if (catchable !== undefined) {
+    return { boardTime: catchable, hasLiveEta: true };
+  }
+  const base = busEtas.length > 0 ? busEtas[busEtas.length - 1] : 0;
+  let projected = base + headwayMinutes;
+  while (projected < earliestBoardMinutes) projected += headwayMinutes;
+  return { boardTime: projected, hasLiveEta: false };
+}
+
+// Sum minutes spent on a bus across all transit legs in the label chain ending
+// at (stopId, round). Used as a tie-breaker when two alight candidates have
+// near-equal total times — fewer ride minutes usually means a less circuitous
+// transfer choice. Footpath transfers and the origin walk don't add to ride.
+function getTotalRideMinutes(
+  stopId: string,
+  round: number,
+  tau: Map<string, number>[],
+  labels: Map<string, JourneyLabel>[],
+): number {
+  let total = 0;
+  let curStop = stopId;
+  let curRound = round;
+  const seen = new Set<string>();
+  while (curRound >= 0 && !seen.has(`${curRound}:${curStop}`)) {
+    seen.add(`${curRound}:${curStop}`);
+    const lbl = labels[curRound]?.get(curStop);
+    if (!lbl) break;
+    if (lbl.type === 'transit') {
+      const arrival = tau[curRound].get(curStop) ?? 0;
+      total += Math.max(0, arrival - lbl.boardTime);
+      curStop = lbl.boardedAtStopId;
+      curRound -= 1;
+    } else {
+      if (lbl.fromStopId === '__ORIGIN__') break;
+      curStop = lbl.fromStopId;
+      // footpath labels live in the same round as the transit leg that
+      // enabled them, so don't decrement the round here.
+    }
+  }
+  return total;
+}
+
 // ─── Service ─────────────────────────────────────────────────────────────────
 
 @Injectable()
@@ -155,6 +212,11 @@ export class TransitRoutingService {
     builtAt: number;
   } | null = null;
 
+  private liveEtaCache: {
+    map: Map<string, Map<string, number[]>>;
+    builtAt: number;
+  } | null = null;
+
   constructor(
     @InjectModel(BusRouteStop.name)
     private readonly busRouteStopModel: Model<BusRouteStop>,
@@ -164,6 +226,25 @@ export class TransitRoutingService {
 
   invalidateNetworkCache(): void {
     this.networkCache = null;
+    this.liveEtaCache = null;
+  }
+
+  // Returns the live ETA map, reusing a recent snapshot when possible so that
+  // back-to-back plan requests see the same bus positions. Without this, two
+  // queries seconds apart can produce different transfer choices as buses tick.
+  private async getLiveEtaMap(
+    routeStopsMap: Map<string, RouteStop[]>,
+  ): Promise<Map<string, Map<string, number[]>>> {
+    const now = Date.now();
+    if (
+      this.liveEtaCache &&
+      now - this.liveEtaCache.builtAt < LIVE_ETA_CACHE_TTL_MS
+    ) {
+      return this.liveEtaCache.map;
+    }
+    const map = await this.computeLiveEtaMap(routeStopsMap);
+    this.liveEtaCache = { map, builtAt: now };
+    return map;
   }
 
   // FIX #1: Coordinate Order Verification
@@ -662,17 +743,24 @@ export class TransitRoutingService {
           const arrivalPrevRound =
             tau[round - 1].get(current.stopId) ?? Infinity;
           if (isFinite(arrivalPrevRound)) {
-            const minCatchable = arrivalPrevRound + MIN_WAIT_MIN;
+            // Transfer boardings (round > 1) require a larger safety margin
+            // before trusting a live ETA — see TRANSFER_UNCERTAINTY_BUFFER_MIN.
+            // First boarding from origin (round === 1) uses only MIN_WAIT_MIN
+            // because the user controls their own start time precisely.
+            const uncertaintyBuffer =
+              round > 1 ? TRANSFER_UNCERTAINTY_BUFFER_MIN : 0;
+            const minCatchable =
+              arrivalPrevRound + MIN_WAIT_MIN + uncertaintyBuffer;
             const busEtas = liveEtaMap.get(routeId)?.get(current.stopId) ?? [];
             const headway = routeInfoMap.get(routeId)?.headwayMinutes ?? 30;
-            const catchable = busEtas.find((eta) => eta >= minCatchable);
-            const candidateTime = catchable ?? minCatchable + headway;
+            const { boardTime: candidateTime, hasLiveEta: candidateLive } =
+              pickBoardTime(busEtas, headway, minCatchable);
 
             if (boardedAtIndex === -1 || candidateTime < boardTime) {
               boardedAtIndex = i;
               boardedAtStopId = current.stopId;
               boardTime = candidateTime;
-              boardHasLiveEta = catchable !== undefined;
+              boardHasLiveEta = candidateLive;
               rideMinutesFromBoard = 0;
             }
           }
@@ -845,7 +933,24 @@ export class TransitRoutingService {
     const roundLabels = labels[round];
     if (!roundLabels || roundLabels.size === 0) return [];
 
-    type Candidate = { stopId: string; total: number; walkMinutes: number };
+    type AltLabel = {
+      routeId: string;
+      boardedAtStopId: string;
+      boardTime: number;
+      hasLiveEta: boolean;
+    };
+    type Candidate = {
+      stopId: string;
+      total: number;
+      walkMinutes: number;
+      rideMinutes: number;
+      // When set, this candidate is an intermediate alight along an existing
+      // transit candidate's bus path. RAPTOR didn't write a transit label here
+      // (a footpath in an earlier round reached this stop with a better time),
+      // but the bus physically passes through, so it's a valid alight option.
+      // Reconstruction uses this override to build the bus segment.
+      altLabel?: AltLabel;
+    };
     const candidates: Candidate[] = [];
 
     for (const stopId of roundLabels.keys()) {
@@ -870,10 +975,147 @@ export class TransitRoutingService {
         stopId,
         total: arrivalAtStop + walkToDest,
         walkMinutes: walkToDest,
+        rideMinutes: getTotalRideMinutes(stopId, round, tau, labels),
       });
     }
 
-    candidates.sort((a, b) => a.total - b.total);
+    // Surface intermediate stops along each transit candidate's bus path as
+    // additional alight options. RAPTOR's labels[round] only records stops
+    // whose tauStar was strictly improved this round — stops the bus passes
+    // but already had a better arrival from an earlier round (e.g. via a
+    // round-1 footpath) won't have a transit label. For alight purposes the
+    // user can step off anywhere the bus stops, so we re-scan each chosen
+    // route's stop list and add every intermediate stop within destSeeds
+    // as an alternate candidate, reusing the same boarding info.
+    const labelBasedIds = new Set(candidates.map((c) => c.stopId));
+    const intermediateBest = new Map<string, Candidate>();
+
+    for (const cand of candidates) {
+      const lbl = roundLabels.get(cand.stopId);
+      if (lbl?.type !== 'transit') continue;
+
+      const routeStops = routeStopsMap.get(lbl.routeId) ?? [];
+      const boardIdx = routeStops.findIndex(
+        (s) => s.stopId === lbl.boardedAtStopId,
+      );
+      const alightIdx = routeStops.findIndex(
+        (s, i) => i > boardIdx && s.stopId === cand.stopId,
+      );
+      if (boardIdx < 0 || alightIdx <= boardIdx + 1) continue;
+
+      const baseRideToBoard = getTotalRideMinutes(
+        lbl.boardedAtStopId,
+        round - 1,
+        tau,
+        labels,
+      );
+
+      let rideMin = 0;
+      for (let i = boardIdx + 1; i < alightIdx; i++) {
+        rideMin += segTime(routeStops[i], routeStops[i - 1]);
+        const sid = routeStops[i].stopId;
+        if (labelBasedIds.has(sid)) continue;
+        const walk = destSeeds.get(sid);
+        if (walk === undefined) continue;
+
+        const total = lbl.boardTime + rideMin + walk;
+        const existing = intermediateBest.get(sid);
+        if (!existing || total < existing.total) {
+          intermediateBest.set(sid, {
+            stopId: sid,
+            total,
+            walkMinutes: walk,
+            rideMinutes: baseRideToBoard + rideMin,
+            altLabel: {
+              routeId: lbl.routeId,
+              boardedAtStopId: lbl.boardedAtStopId,
+              boardTime: lbl.boardTime,
+              hasLiveEta: lbl.hasLiveEta,
+            },
+          });
+        }
+      }
+    }
+    candidates.push(...intermediateBest.values());
+
+    // Primary sort: total time. Tie-breaker: among candidates within
+    // TIE_DELTA_MIN of the global best, prefer fewer bus-ride minutes —
+    // this picks geographically direct transfers when timing is roughly equal.
+    // Using a global best (rather than pairwise delta) keeps the comparator
+    // transitive, which is required for a well-defined sort.
+    if (candidates.length > 1) {
+      const bestTotal = Math.min(...candidates.map((c) => c.total));
+      candidates.sort((a, b) => {
+        const aInTie = a.total - bestTotal <= TIE_DELTA_MIN;
+        const bInTie = b.total - bestTotal <= TIE_DELTA_MIN;
+        if (aInTie && bInTie) return a.rideMinutes - b.rideMinutes;
+        return a.total - b.total;
+      });
+    }
+
+    // Diagnostic: dump every stop RAPTOR reached by bus in this round, with
+    // the destSeeds walk-to-destination (or EXCLUDED if Valhalla put it
+    // outside the bestDur+10 window). Use this to figure out why a stop you
+    // expected to alight at isn't a candidate.
+    const allTransitReached: string[] = [];
+    for (const [sid, lbl] of roundLabels) {
+      if (lbl.type !== 'transit') continue;
+      const arrive = tau[round].get(sid);
+      const walk = destSeeds.get(sid);
+      const name = stopInfoMap.get(sid)?.name ?? sid;
+      const walkStr = walk === undefined ? 'EXCLUDED' : `${walk.toFixed(1)}m`;
+      const arriveStr = arrive !== undefined ? arrive.toFixed(1) : '-';
+      allTransitReached.push(`${name}(arrive=${arriveStr}, walk=${walkStr})`);
+    }
+    this.logger.debug(
+      `[round=${round}] all bus-reached stops: ${allTransitReached.join(' | ')}`,
+    );
+
+    // Diagnostic: log the top alight candidates with their breakdown so you
+    // can see which transfer point won and why (arrival time vs. final walk).
+    // Trace the label chain on the winner to surface the actual transfer stop.
+    if (candidates.length > 0) {
+      const top = candidates.slice(0, 5).map((c) => {
+        const name = stopInfoMap.get(c.stopId)?.name ?? c.stopId;
+        const arrival = (tau[round].get(c.stopId) ?? Infinity).toFixed(1);
+        return `${name} total=${c.total.toFixed(1)}m (arrive=${arrival}m, walk=${c.walkMinutes.toFixed(1)}m, ride=${c.rideMinutes.toFixed(1)}m)`;
+      });
+      this.logger.debug(
+        `[round=${round}] top alight candidates: ${top.join(' | ')}`,
+      );
+
+      // Walk backwards through the labels for the winner to expose the chosen
+      // boarding/transfer stops — this is what actually drove the plan.
+      const trace: string[] = [];
+      let curStop = candidates[0].stopId;
+      let curRound = round;
+      const seen = new Set<string>();
+      while (curRound >= 0 && !seen.has(`${curRound}:${curStop}`)) {
+        seen.add(`${curRound}:${curStop}`);
+        const lbl = labels[curRound].get(curStop);
+        if (!lbl) break;
+        const here = stopInfoMap.get(curStop)?.name ?? curStop;
+        if (lbl.type === 'transit') {
+          const from =
+            stopInfoMap.get(lbl.boardedAtStopId)?.name ?? lbl.boardedAtStopId;
+          trace.push(
+            `bus ${routeInfoMap.get(lbl.routeId)?.code ?? lbl.routeId}: ${from} → ${here} (board@${lbl.boardTime.toFixed(1)}m)`,
+          );
+          curStop = lbl.boardedAtStopId;
+          curRound -= 1;
+        } else if (lbl.fromStopId === '__ORIGIN__') {
+          trace.push(`walk: origin → ${here}`);
+          break;
+        } else {
+          const from = stopInfoMap.get(lbl.fromStopId)?.name ?? lbl.fromStopId;
+          trace.push(`walk: ${from} → ${here} (${lbl.distMeters.toFixed(0)}m)`);
+          curStop = lbl.fromStopId;
+        }
+      }
+      this.logger.debug(
+        `[round=${round}] winner trace: ${trace.reverse().join(' → ')}`,
+      );
+    }
 
     const seenJourneyKey = new Set<string>();
     const dedupedOptions: RawOption[] = [];
@@ -893,6 +1135,7 @@ export class TransitRoutingService {
         routeStopsMap,
         liveEtaMap,
         valhallaWalkCache,
+        candidate.altLabel,
       );
       if (option && !seenJourneyKey.has(option.fingerprint)) {
         seenJourneyKey.add(option.fingerprint);
@@ -919,6 +1162,17 @@ export class TransitRoutingService {
       string,
       { path: Coords[]; distanceMeters: number; durationSeconds: number } | null
     >,
+    // Used for intermediate-alight candidates where the bus passes through
+    // bestStopId but labels[round][bestStopId] doesn't reflect that bus leg
+    // (a prior round set a better arrival via a different path). When present,
+    // the label lookup at the alight stop is replaced with this synthetic
+    // transit label so the bus segment is built correctly.
+    alightOverride?: {
+      routeId: string;
+      boardedAtStopId: string;
+      boardTime: number;
+      hasLiveEta: boolean;
+    },
   ): Promise<RawOption | null> {
     // Helper: get a Valhalla walk result, using the shared cache to avoid duplicate calls.
     const pairKey = (from: Coords, to: Coords) =>
@@ -946,7 +1200,22 @@ export class TransitRoutingService {
       if (visited.has(`${currentRound}:${currentStopId}`)) break;
       visited.add(`${currentRound}:${currentStopId}`);
 
-      const label = labels[currentRound].get(currentStopId);
+      // For intermediate-alight candidates, the alight stop has no transit
+      // label in labels[round] (an earlier-round footpath wrote a better-time
+      // walk label). Substitute the synthetic transit label so the first
+      // iteration emits a proper bus segment. Subsequent iterations use real
+      // labels because either the stop differs or the round has decremented.
+      const label: JourneyLabel | undefined =
+        currentStopId === bestStopId && currentRound === round && alightOverride
+          ? {
+              type: 'transit',
+              routeId: alightOverride.routeId,
+              boardedAtStopId: alightOverride.boardedAtStopId,
+              boardTime: alightOverride.boardTime,
+              fromStopId: alightOverride.boardedAtStopId,
+              hasLiveEta: alightOverride.hasLiveEta,
+            }
+          : labels[currentRound].get(currentStopId);
       if (!label) break;
 
       if (label.type === 'walk') {
@@ -1100,15 +1369,14 @@ export class TransitRoutingService {
   }
 
   // Re-evaluate every bus leg's catchability using the final (Valhalla-enriched)
-  // walk times. RAPTOR used approximate seed times; this is the authoritative pass.
-  // We walk segments in order, accumulate the true elapsed user time to each
-  // boarding stop, then pick the first live ETA >= (arrival + MIN_WAIT_MIN).
-  // If no live ETA qualifies (bus already gone), fall back to scheduled headway
-  // from the user's earliest possible board time.
+  // walk times. RAPTOR used approximate seed times; this is the authoritative
+  // pass that decides which bus the user actually boards. Applies to every bus
+  // leg in the journey, including ones reached via a transfer.
   private recheckBusCatchability(rawOptions: RawOption[]): void {
     for (const opt of rawOptions) {
       let cumulativeMinutes = 0; // real elapsed time for the user up to each point
       let totalRecalc = 0;
+      let busSegmentsSeen = 0;
 
       for (const seg of opt.segments as any[]) {
         if (seg.type === 'walk') {
@@ -1118,32 +1386,42 @@ export class TransitRoutingService {
         }
 
         if (seg.type === 'bus') {
+          busSegmentsSeen++;
           const boardEdge = seg._boardEdge as BoardEdge | undefined;
           if (boardEdge) {
-            // Earliest the user can board: must have walked to stop + MIN_WAIT_MIN buffer.
-            // Any live ETA before this threshold is already missed — skip it.
-            const earliestBoard = cumulativeMinutes + MIN_WAIT_MIN;
+            // Mirror runRaptor: transfer boardings (any bus after the first)
+            // require a larger buffer before trusting a live ETA. The first
+            // boarding stays at MIN_WAIT_MIN because the user controls the
+            // start time.
+            const uncertaintyBuffer =
+              busSegmentsSeen > 1 ? TRANSFER_UNCERTAINTY_BUFFER_MIN : 0;
+            const earliestBoard =
+              cumulativeMinutes + MIN_WAIT_MIN + uncertaintyBuffer;
             const hw = boardEdge.headwayMinutes ?? 30;
-
-            // Find the first live ETA the user can actually catch.
-            const catchableEta = boardEdge.busEtas.find(
-              (eta) => eta >= earliestBoard,
+            const { boardTime, hasLiveEta } = pickBoardTime(
+              boardEdge.busEtas,
+              hw,
+              earliestBoard,
             );
-
-            // If no live ETA is catchable, use headway FROM earliestBoard —
-            // NOT minCatchable + headway, which would double-count the wait.
-            const boardTime = catchableEta ?? earliestBoard + hw;
 
             seg.waitMinutes = Math.round(
               Math.max(0, boardTime - cumulativeMinutes),
             );
             seg.totalLegMinutes =
               (seg.waitMinutes as number) + (seg.rideMinutes as number);
-            // Only mark as live if a real ETA was catchable
-            seg.hasLiveEta = catchableEta !== undefined;
+            seg.hasLiveEta = hasLiveEta;
 
-            // Expose ETAs for client display, remove internal edge
-            seg.busEtas = boardEdge.busEtas;
+            // Only expose ETAs the user can still catch. The uncatchable buses
+            // RAPTOR saw (e.g. one arriving in 3 min when the user needs 9 min
+            // to walk there) are useless to the client and confusing if shown
+            // as "Bus in ~3 min".
+            seg.busEtas = boardEdge.busEtas.filter(
+              (eta) => eta >= earliestBoard,
+            );
+            // boardTime is in minutes from `now`; this is the single number the
+            // client should display as "Bus arrives in N min". Falls back to a
+            // headway-projected next-lap arrival when no live bus is catchable.
+            seg.nextBusInMinutes = Math.round(boardTime);
             delete seg._boardEdge;
           }
 
@@ -1295,7 +1573,7 @@ export class TransitRoutingService {
       return { found: false as const, type: 'transit' as const, options: [] };
     }
 
-    const liveEtaMap = await this.computeLiveEtaMap(network.routeStopsMap);
+    const liveEtaMap = await this.getLiveEtaMap(network.routeStopsMap);
 
     // Shared Valhalla cache: reused across all attempts and reconstruction
     // so we never call Valhalla twice for the same coordinate pair.
