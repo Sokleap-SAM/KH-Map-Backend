@@ -1,3 +1,6 @@
+/* eslint-disable @typescript-eslint/no-unsafe-argument */
+/* eslint-disable @typescript-eslint/no-unsafe-member-access */
+/* eslint-disable @typescript-eslint/no-unsafe-assignment */
 /* eslint-disable @typescript-eslint/no-unsafe-return */
 import {
   Injectable,
@@ -25,6 +28,8 @@ export interface TripLiveData {
   passengerCount: number;
   longitude: number;
   latitude: number;
+  heading: number;
+  busImage: string;
 }
 
 @Injectable()
@@ -50,6 +55,8 @@ export class BusTripService {
       passengerCount: String(data.passengerCount),
       longitude: String(data.longitude),
       latitude: String(data.latitude),
+      heading: String(data.heading || 0),
+      busImage: data.busImage || 'bus_go_right.png',
     });
     // Refresh TTL on every write so abandoned trips eventually expire
     await this.redisService.expire(key, TRIP_LIVE_TTL_SECONDS);
@@ -70,6 +77,8 @@ export class BusTripService {
       passengerCount: Number(data.passengerCount),
       longitude: Number(data.longitude),
       latitude: Number(data.latitude),
+      heading: Number(data.heading || 0),
+      busImage: data.busImage || 'bus_go_right.png',
     };
   }
 
@@ -78,16 +87,39 @@ export class BusTripService {
     await this.redisService.georemove(this.GEO_KEY, tripId);
   }
 
-  private mergeLiveData(trip: any, live: TripLiveData | null) {
+  private async mergeLiveData(trip: any, live: TripLiveData | null) {
+    const routeId = trip.route?._id || trip.route;
+    const stops = await this.busRouteStopService.findByRoute(routeId);
+
+    const nextStop =
+      live && stops[live.nextStopIndex]
+        ? (stops[live.nextStopIndex].stop as any).name
+        : 'ស្វែងរកចំណត...';
+
+    const destination = trip.route?.name || 'មិនច្បាស់លាស់';
+
+    const allStopNames = stops.map((s) => (s.stop as any)?.name || 'Unknown');
+
     return {
       ...trip,
+      routeNumber: trip.route?.code || '??',
+      nextStopName: nextStop,
+      direction: destination,
+      allStops: allStopNames,
+      busNumber: trip.bus?.busNumber || 'N/A',
       currentStopIndex: live?.currentStopIndex ?? null,
-      nextStopIndex: live?.nextStopIndex ?? null,
+      nextStopIndex: live?.nextStopIndex ?? 1,
       passengerCount: live?.passengerCount ?? null,
+      heading: live?.heading ?? 0,
+      busImage: live?.busImage ?? 'bus_go_right.png',
       currentLocation: live
         ? { type: 'Point', coordinates: [live.longitude, live.latitude] }
         : null,
     };
+  }
+
+  private calculateBusDirection(oldLng: number, newLng: number): string {
+    return newLng < oldLng ? 'bus_go_left.png' : 'bus_go_right.png';
   }
 
   async create(dto: CreateBusTripDto) {
@@ -115,6 +147,8 @@ export class BusTripService {
       passengerCount: 0,
       longitude: lng,
       latitude: lat,
+      heading: 0,
+      busImage: 'bus_go_right.png',
     });
 
     const live = await this.getLiveData(tripId);
@@ -146,7 +180,7 @@ export class BusTripService {
     return Promise.all(
       trips.map(async (trip) => {
         const live = await this.getLiveData(trip._id.toString());
-        return this.mergeLiveData(trip, live);
+        return await this.mergeLiveData(trip, live);
       }),
     );
   }
@@ -212,15 +246,23 @@ export class BusTripService {
       dto.nextStopIndex != null ||
       dto.passengerCount != null
     ) {
+      const newLng =
+        dto.currentLocation?.coordinates[0] ?? currentLive?.longitude ?? 0;
+      const busImage = this.calculateBusDirection(
+        currentLive?.longitude ?? newLng,
+        newLng,
+      );
+
       const updatedLive: TripLiveData = {
         currentStopIndex:
           dto.currentStopIndex ?? currentLive?.currentStopIndex ?? 0,
         nextStopIndex: dto.nextStopIndex ?? currentLive?.nextStopIndex ?? 0,
         passengerCount: dto.passengerCount ?? currentLive?.passengerCount ?? 0,
-        longitude:
-          dto.currentLocation?.coordinates[0] ?? currentLive?.longitude ?? 0,
+        longitude: newLng,
         latitude:
           dto.currentLocation?.coordinates[1] ?? currentLive?.latitude ?? 0,
+        heading: 0,
+        busImage: busImage,
       };
       await this.setLiveData(tripId, updatedLive);
     }

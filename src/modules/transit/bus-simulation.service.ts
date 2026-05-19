@@ -11,6 +11,7 @@ import { BusRouteStopService } from './bus-route-stop.service';
 import { BusLocationService } from './bus-location.service';
 import { BusTripService, TripLiveData } from './bus-trip.service';
 import { BusRouteStop } from './entities/bus-route-stop.schema';
+import { privateEncrypt } from 'crypto';
 
 // ─── Tunable constants ────────────────────────────────────────────────────────
 
@@ -48,6 +49,7 @@ interface TripSimState {
   passengerCount: number;
   waypointIdx: number; // index into segmentCoords the bus is heading toward
   segmentCoords: [number, number][]; // road waypoints for the current inter-stop segment
+  currentPos: [number, number];
 }
 
 // ─── Geometry helpers ─────────────────────────────────────────────────────────
@@ -111,7 +113,7 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
     private readonly busRouteStopService: BusRouteStopService,
     private readonly busLocationService: BusLocationService,
     private readonly busTripService: BusTripService,
-  ) {}
+  ) { }
 
   onModuleInit(): void {
     this.start();
@@ -245,6 +247,7 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
       currentStopIdx = 0;
       nextStopIdx = stops.length > 1 ? 1 : 0;
       passengerCount = 0;
+      const meta = this.getLiveMetadata(pos);
       // Seed Redis so the bus is visible before the first tick fires
       await this.busTripService.setLiveData(tripId, {
         currentStopIndex: currentStopIdx,
@@ -252,6 +255,7 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
         passengerCount,
         longitude: pos[0],
         latitude: pos[1],
+        ...meta
       });
     } else {
       pos = [live.longitude, live.latitude];
@@ -263,13 +267,14 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
     this.trips.set(tripId, {
       tripId,
       busId: String(trip.bus),
-      routeId,
-      pos,
+      routeId: String(trip.route),
+      pos: pos as [number, number],
       currentStopIdx,
       nextStopIdx,
       passengerCount,
       waypointIdx: 1,
-      segmentCoords: this.buildSegmentCoords(stops, nextStopIdx, pos),
+      segmentCoords: this.buildSegmentCoords(stops, nextStopIdx, pos as [number, number]),
+      currentPos: pos as [number, number],
     });
 
     this.logger.verbose(
@@ -285,6 +290,8 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
 
     const stops = this.routeStopCache.get(state.routeId);
     if (!stops) return;
+
+    const oldPos = [...state.pos] as [number, number];
 
     if (state.nextStopIdx >= stops.length) {
       await this.completeTrip(state, stops);
@@ -302,6 +309,11 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
         return;
       }
 
+      const heading = this.headingFromState(segmentCoords, pos, waypointIdx);
+      const busImage = pos[0] < oldPos[0] ? 'bus_go_left.png' : 'bus_go_right.png';
+
+      state.pos = pos;
+      state.waypointIdx = waypointIdx; 
       const target = segmentCoords[waypointIdx];
       const dist = haversineMeters(pos, target);
 
@@ -325,6 +337,7 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
 
     state.pos = pos;
     state.waypointIdx = waypointIdx;
+    const meta = this.getLiveMetadata(pos);
 
     // Publish to Redis
     const liveData: TripLiveData = {
@@ -333,6 +346,7 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
       passengerCount: state.passengerCount,
       longitude: pos[0],
       latitude: pos[1],
+      ...meta,
     };
     await this.busTripService.setLiveData(state.tripId, liveData);
 
@@ -365,13 +379,18 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    const pos = stopCoords(stops[newCurrentStopIdx].stop);
+    const stopPos = stopCoords(stops[newCurrentStopIdx].stop);
+    state.currentPos = stopPos;
 
-    state.pos = pos;
     state.currentStopIdx = newCurrentStopIdx;
     state.nextStopIdx = newNextStopIdx;
-    state.segmentCoords = this.buildSegmentCoords(stops, newNextStopIdx, pos);
+
+    state.segmentCoords = this.buildSegmentCoords(stops, newNextStopIdx, stopPos);
     state.waypointIdx = 1;
+
+    const prevPos = state.currentPos;
+    const pos = state.segmentCoords[state.waypointIdx];
+    state.currentPos = pos;
 
     await this.busTripService.setLiveData(state.tripId, {
       currentStopIndex: newCurrentStopIdx,
@@ -379,6 +398,8 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
       passengerCount: state.passengerCount,
       longitude: pos[0],
       latitude: pos[1],
+      heading: 0,
+      busImage: pos[0] < (prevPos?.[0] ?? pos[0]) ? 'bus_go_left.png' : 'bus_go_right.png',
     });
   }
 
@@ -398,12 +419,15 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
     state.passengerCount = 0;
     state.segmentCoords = this.buildSegmentCoords(stops, nextStopIdx, pos);
 
+    const meta = this.getLiveMetadata(pos);
+
     await this.busTripService.setLiveData(state.tripId, {
       currentStopIndex: 0,
       nextStopIndex: nextStopIdx,
       passengerCount: 0,
       longitude: pos[0],
       latitude: pos[1],
+      ...meta,
     });
 
     this.logger.log(`Trip ${state.tripId} completed — looping back to start`);
@@ -458,5 +482,15 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
     }
 
     return [currentPos, stopCoords(stops[nextStopIdx].stop)];
+  }
+
+  private getLiveMetadata(currentPos: [number, number], prevPos?: [number, number]) {
+    const lng = currentPos[0];
+    const prevLng = prevPos ? prevPos[0] : lng;
+
+    return {
+      heading: 0,
+      busImage: lng < prevLng ? 'bus_go_left.png' : 'bus_go_right.png'
+    };
   }
 }
