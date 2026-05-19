@@ -11,6 +11,8 @@ import { DatabaseModule } from './shared/database/database.module';
 import { RedisModule } from './shared/redis/redis.module';
 import { PlaceModule } from './modules/places/place.module';
 import { TransitModule } from './modules/transit/transit.module';
+import { UsersModule } from './modules/users/user.module';
+import { SearchHistoryModule } from './modules/search-history/search-history.module';
 
 @Module({
   imports: [
@@ -23,6 +25,8 @@ import { TransitModule } from './modules/transit/transit.module';
     RedisModule,
     PlaceModule,
     TransitModule,
+    UsersModule,
+    SearchHistoryModule,
   ],
 })
 export class AppModule {}

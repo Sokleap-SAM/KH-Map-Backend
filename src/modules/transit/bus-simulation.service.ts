@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/await-thenable */
 import {
   Injectable,
   Logger,
@@ -242,6 +243,7 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
       currentStopIdx = 0;
       nextStopIdx = stops.length > 1 ? 1 : 0;
       passengerCount = 0;
+      const meta = this.getLiveMetadata(pos);
       // Seed Redis so the bus is visible before the first tick fires
       await this.busTripService.setLiveData(tripId, {
         currentStopIndex: currentStopIdx,
@@ -249,6 +251,7 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
         passengerCount,
         longitude: pos[0],
         latitude: pos[1],
+        ...meta,
       });
     } else {
       pos = [live.longitude, live.latitude];
@@ -356,19 +359,18 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
     state.pos = pos;
     state.waypointIdx = waypointIdx;
     state.segmentCoords = segCoords;
+    const meta = this.getLiveMetadata(pos);
 
-    // Single Redis write per tick — covers both mid-segment moves and stop arrivals.
-    // Wrapped in a timeout race: if Redis is reconnecting (ioredis queues the
-    // command indefinitely), this prevents the tick from hanging forever and
-    // keeping `this.processing = true`, which would freeze all buses permanently.
+    // Publish to Redis
     const liveData: TripLiveData = {
       currentStopIndex: state.currentStopIdx,
       nextStopIndex: state.nextStopIdx,
       passengerCount: state.passengerCount,
       longitude: pos[0],
       latitude: pos[1],
+      ...meta,
     };
-    await this.writeWithTimeout(state.tripId, liveData);
+    await this.busTripService.setLiveData(state.tripId, liveData);
 
     // Write GPS history (fire-and-forget — does not block the tick)
     this.busLocationService
@@ -409,6 +411,8 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
       passengerCount: 0,
       longitude: pos[0],
       latitude: pos[1],
+      heading: 0,
+      busImage: '',
     });
 
     // Publish the new position to bus:trip:{tripId}:location and the geo set
@@ -542,5 +546,18 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
     }
 
     return [currentPos, stopCoords(stops[nextStopIdx].stop)];
+  }
+
+  private getLiveMetadata(
+    currentPos: [number, number],
+    prevPos?: [number, number],
+  ) {
+    const lng = currentPos[0];
+    const prevLng = prevPos ? prevPos[0] : lng;
+
+    return {
+      heading: 0,
+      busImage: lng < prevLng ? 'bus_go_left.png' : 'bus_go_right.png',
+    };
   }
 }

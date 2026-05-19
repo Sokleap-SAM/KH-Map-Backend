@@ -1,11 +1,25 @@
-import { Injectable, Inject } from '@nestjs/common';
+import { Injectable, Inject, Logger } from '@nestjs/common';
 import { Redis } from 'ioredis';
 
 export const REDIS_CLIENT = 'REDIS_CLIENT';
 
 @Injectable()
 export class RedisService {
+  private readonly logger = new Logger(RedisService.name);
+  private lastWarnAt = 0;
+
   constructor(@Inject(REDIS_CLIENT) private readonly redisClient: Redis) {}
+
+  // Warns at most once every 30 s so a downed Redis doesn't flood the log.
+  private warnUnavailable(op: string, err: unknown): void {
+    const now = Date.now();
+    if (now - this.lastWarnAt > 30_000) {
+      this.lastWarnAt = now;
+      this.logger.warn(
+        `Redis unavailable during ${op}: ${(err as Error).message}. Returning degraded result.`,
+      );
+    }
+  }
 
   /**
    * Set a key-value pair in Redis
@@ -15,10 +29,14 @@ export class RedisService {
    */
   async set(key: string, value: any, ttl?: number): Promise<void> {
     const stringifiedValue = JSON.stringify(value);
-    if (ttl) {
-      await this.redisClient.set(key, stringifiedValue, 'EX', ttl);
-    } else {
-      await this.redisClient.set(key, stringifiedValue);
+    try {
+      if (ttl) {
+        await this.redisClient.set(key, stringifiedValue, 'EX', ttl);
+      } else {
+        await this.redisClient.set(key, stringifiedValue);
+      }
+    } catch (err) {
+      this.warnUnavailable('set', err);
     }
   }
 
@@ -26,32 +44,54 @@ export class RedisService {
    * Get a value from Redis by key
    */
   async get<T>(key: string): Promise<T | null> {
-    const data = await this.redisClient.get(key);
-    if (!data) return null;
-    return JSON.parse(data) as T;
+    try {
+      const data = await this.redisClient.get(key);
+      if (!data) return null;
+      return JSON.parse(data) as T;
+    } catch (err) {
+      this.warnUnavailable('get', err);
+      return null;
+    }
   }
 
   /**
    * Delete a key
    */
   async del(key: string): Promise<void> {
-    await this.redisClient.del(key);
+    try {
+      await this.redisClient.del(key);
+    } catch (err) {
+      this.warnUnavailable('del', err);
+    }
   }
 
   // ─── Hash operations ───────────────────────────────────────
 
   async hset(key: string, data: Record<string, string>): Promise<void> {
-    await this.redisClient.hset(key, data);
+    try {
+      await this.redisClient.hset(key, data);
+    } catch (err) {
+      this.warnUnavailable('hset', err);
+    }
   }
 
   async hgetall(key: string): Promise<Record<string, string> | null> {
-    const data = await this.redisClient.hgetall(key);
-    if (!data || Object.keys(data).length === 0) return null;
-    return data;
+    try {
+      const data = await this.redisClient.hgetall(key);
+      if (!data || Object.keys(data).length === 0) return null;
+      return data;
+    } catch (err) {
+      this.warnUnavailable('hgetall', err);
+      return null;
+    }
   }
 
   async hdel(key: string): Promise<void> {
-    await this.redisClient.del(key);
+    try {
+      await this.redisClient.del(key);
+    } catch (err) {
+      this.warnUnavailable('hdel', err);
+    }
   }
 
   // ─── Geo operations (for bus locations) ────────────────────
@@ -62,7 +102,11 @@ export class RedisService {
     latitude: number,
     member: string,
   ): Promise<void> {
-    await this.redisClient.geoadd(key, longitude, latitude, member);
+    try {
+      await this.redisClient.geoadd(key, longitude, latitude, member);
+    } catch (err) {
+      this.warnUnavailable('geoadd', err);
+    }
   }
 
   async geosearch(
@@ -71,27 +115,41 @@ export class RedisService {
     latitude: number,
     radiusMeters: number,
   ): Promise<string[]> {
-    const result = await this.redisClient.geosearch(
-      key,
-      'FROMLONLAT',
-      longitude,
-      latitude,
-      'BYRADIUS',
-      radiusMeters,
-      'm',
-      'ASC',
-    );
-    return result as string[];
+    try {
+      const result = await this.redisClient.geosearch(
+        key,
+        'FROMLONLAT',
+        longitude,
+        latitude,
+        'BYRADIUS',
+        radiusMeters,
+        'm',
+        'ASC',
+      );
+      return result as string[];
+    } catch (err) {
+      this.warnUnavailable('geosearch', err);
+      return [];
+    }
   }
 
   async geopos(key: string, member: string): Promise<[string, string] | null> {
-    const result = await this.redisClient.geopos(key, member);
-    if (!result || !result[0]) return null;
-    return result[0] as [string, string];
+    try {
+      const result = await this.redisClient.geopos(key, member);
+      if (!result || !result[0]) return null;
+      return result[0] as [string, string];
+    } catch (err) {
+      this.warnUnavailable('geopos', err);
+      return null;
+    }
   }
 
   async georemove(key: string, member: string): Promise<void> {
-    await this.redisClient.zrem(key, member);
+    try {
+      await this.redisClient.zrem(key, member);
+    } catch (err) {
+      this.warnUnavailable('georemove', err);
+    }
   }
 
   async expire(key: string, ttlSeconds: number): Promise<void> {
