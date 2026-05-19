@@ -1,3 +1,6 @@
+/* eslint-disable @typescript-eslint/no-unsafe-argument */
+/* eslint-disable @typescript-eslint/no-unsafe-member-access */
+/* eslint-disable @typescript-eslint/no-unsafe-assignment */
 /* eslint-disable @typescript-eslint/no-unsafe-return */
 import {
   Injectable,
@@ -53,7 +56,7 @@ export class BusTripService {
       longitude: String(data.longitude),
       latitude: String(data.latitude),
       heading: String(data.heading || 0),
-      busImage: data.busImage || 'bus_go_right.png'
+      busImage: data.busImage || 'bus_go_right.png',
     });
     // Refresh TTL on every write so abandoned trips eventually expire
     await this.redisService.expire(key, TRIP_LIVE_TTL_SECONDS);
@@ -75,7 +78,7 @@ export class BusTripService {
       longitude: Number(data.longitude),
       latitude: Number(data.latitude),
       heading: Number(data.heading || 0),
-      busImage: data.busImage || 'bus_go_right.png'
+      busImage: data.busImage || 'bus_go_right.png',
     };
   }
 
@@ -88,18 +91,21 @@ export class BusTripService {
     const routeId = trip.route?._id || trip.route;
     const stops = await this.busRouteStopService.findByRoute(routeId);
 
-    const nextStop = live && stops[live.nextStopIndex]
-      ? (stops[live.nextStopIndex].stop as any).name
-      : 'ស្វែងរកចំណត...';
+    const nextStop =
+      live && stops[live.nextStopIndex]
+        ? (stops[live.nextStopIndex].stop as any).name
+        : 'ស្វែងរកចំណត...';
 
-    const destination = trip.route?.name ||
-      'មិនច្បាស់លាស់';
+    const destination = trip.route?.name || 'មិនច្បាស់លាស់';
+
+    const allStopNames = stops.map((s) => (s.stop as any)?.name || 'Unknown');
 
     return {
       ...trip,
       routeNumber: trip.route?.code || '??',
       nextStopName: nextStop,
       direction: destination,
+      allStops: allStopNames,
       busNumber: trip.bus?.busNumber || 'N/A',
       currentStopIndex: live?.currentStopIndex ?? null,
       nextStopIndex: live?.nextStopIndex ?? 1,
@@ -240,9 +246,12 @@ export class BusTripService {
       dto.nextStopIndex != null ||
       dto.passengerCount != null
     ) {
-
-      const newLng = dto.currentLocation?.coordinates[0] ?? currentLive?.longitude ?? 0;
-      const busImage = this.calculateBusDirection(currentLive?.longitude ?? newLng, newLng)
+      const newLng =
+        dto.currentLocation?.coordinates[0] ?? currentLive?.longitude ?? 0;
+      const busImage = this.calculateBusDirection(
+        currentLive?.longitude ?? newLng,
+        newLng,
+      );
 
       const updatedLive: TripLiveData = {
         currentStopIndex:
