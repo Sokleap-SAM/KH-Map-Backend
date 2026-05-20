@@ -42,4 +42,10 @@ export class ReportBusLocationDto {
   @Min(0)
   @IsOptional()
   speed?: number;
+
+  /** Index of the last stop the bus departed from, used for ETA accuracy. */
+  @IsNumber()
+  @Min(0)
+  @IsOptional()
+  currentStopIndex?: number;
 }

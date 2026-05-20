@@ -20,11 +20,6 @@ export class CreateBusRouteStopDto {
   @IsNumber()
   distanceFromPrevious?: number;
 
-  @IsOptional()
-  @Transform(({ value }) => (value != null ? Number(value) : undefined))
-  @IsNumber()
-  estimatedTimeFromPrevious?: number;
-
   /**
    * Middle waypoints only — [longitude, latitude] pairs tracing the road between
    * the previous stop and this stop. Do NOT include the start or end coordinates;

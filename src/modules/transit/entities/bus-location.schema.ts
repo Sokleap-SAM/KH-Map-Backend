@@ -42,7 +42,16 @@ export class BusLocation extends BaseEntity {
 
 export const BusLocationSchema = SchemaFactory.createForClass(BusLocation);
 
-// Fast lookups: latest ping per trip, and geo-queries
-BusLocationSchema.index({ trip: 1, recordedAt: -1 });
-BusLocationSchema.index({ route: 1, recordedAt: -1 });
+// One document per active trip (BusLocationService.reportLocation upserts on
+// this key), so a plain (non-compound) index is enough — no `recordedAt`
+// secondary key needed because there's only ever one matching doc per trip.
+BusLocationSchema.index({ trip: 1 });
+BusLocationSchema.index({ route: 1 });
 BusLocationSchema.index({ location: '2dsphere' });
+
+// TTL safety net: if a trip stops being updated (crashed simulator, paused
+// service), the document is removed after 24h. Active trips keep their
+// `recordedAt` fresh on every persisted update, so they never expire.
+// 86400 = BUS_LOCATION_DB_TTL_SECONDS — hard-coded here because Mongoose
+// index options must be statically analysable.
+BusLocationSchema.index({ recordedAt: 1 }, { expireAfterSeconds: 86400 });

@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/await-thenable */
 import {
   Injectable,
   Logger,
@@ -11,30 +12,20 @@ import { BusRouteStopService } from './bus-route-stop.service';
 import { BusLocationService } from './bus-location.service';
 import { BusTripService, TripLiveData } from './bus-trip.service';
 import { BusRouteStop } from './entities/bus-route-stop.schema';
-import { privateEncrypt } from 'crypto';
-
-// ─── Tunable constants ────────────────────────────────────────────────────────
-
-/**
- * Wall-clock interval between position updates (ms).
- * setInterval gives a fixed period independent of processing duration.
- * Use the \processing\ guard to drop overlapping ticks when load is high.
- */
-const TICK_MS = 1_000;
-
-/**
- * Simulated bus speed (km/h).
- * 30 km/h is a realistic urban city-bus average.
- * Metres moved per tick = (30 × 1000 / 3600) × 1 s ≈ 8.3 m
- */
-const BUS_SPEED_KMH = 30;
-const SPEED_M_PER_TICK = (BUS_SPEED_KMH * 1_000) / 3_600; // ≈ 8.3 m
-
-/**
- * Re-sync the active-trip list from MongoDB every N ticks.
- * Picks up newly started trips without querying DB on every single tick.
- */
-const SYNC_EVERY_N_TICKS = 5;
+import { RedisService } from '../../shared/redis/redis.service';
+import {
+  TICK_MS,
+  BUS_SIMULATION_SPEED_KMH,
+  SIMULATION_SPEED_M_PER_TICK,
+  SYNC_EVERY_N_TICKS,
+  SIM_LOCK_TTL_SECONDS,
+} from '../../shared/constants/constants';
+import {
+  Coords,
+  haversineMeters,
+  computeHeading,
+  pointToSegmentDistance,
+} from '../../shared/helpers/helper-functions';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -43,50 +34,22 @@ interface TripSimState {
   tripId: string;
   busId: string;
   routeId: string;
-  pos: [number, number]; // current [lng, lat]
+  pos: Coords;
   currentStopIdx: number;
   nextStopIdx: number;
   passengerCount: number;
   waypointIdx: number; // index into segmentCoords the bus is heading toward
-  segmentCoords: [number, number][]; // road waypoints for the current inter-stop segment
-  currentPos: [number, number];
+  segmentCoords: Coords[]; // road waypoints for the current inter-stop segment
 }
 
 // ─── Geometry helpers ─────────────────────────────────────────────────────────
 
 /** Extract [lng, lat] from a populated stop document. */
-function stopCoords(stop: BusRouteStop['stop']): [number, number] {
+function stopCoords(stop: BusRouteStop['stop']): Coords {
   const place = stop as unknown as {
-    location: { coordinates: [number, number] };
+    location: { coordinates: Coords };
   };
   return place.location.coordinates;
-}
-
-function haversineMeters(
-  [lng1, lat1]: [number, number],
-  [lng2, lat2]: [number, number],
-): number {
-  const R = 6_371_000;
-  const toRad = (d: number) => (d * Math.PI) / 180;
-  const dLat = toRad(lat2 - lat1);
-  const dLng = toRad(lng2 - lng1);
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-
-function computeHeading(
-  [lng1, lat1]: [number, number],
-  [lng2, lat2]: [number, number],
-): number {
-  const toRad = (d: number) => (d * Math.PI) / 180;
-  const dLng = toRad(lng2 - lng1);
-  const y = Math.sin(dLng) * Math.cos(toRad(lat2));
-  const x =
-    Math.cos(toRad(lat1)) * Math.sin(toRad(lat2)) -
-    Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(dLng);
-  return (Math.atan2(y, x) * (180 / Math.PI) + 360) % 360;
 }
 
 // ─── Service ──────────────────────────────────────────────────────────────────
@@ -107,16 +70,24 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
   private processing = false;
   private _running = false;
 
+  /**
+   * Unique ID for this process instance — stored in the Redis lock so only
+   * the owning instance can renew or release it.
+   */
+  private readonly instanceId = Math.random().toString(36).slice(2);
+  private static readonly LOCK_KEY = 'sim:master:lock';
+
   constructor(
     @InjectModel(BusTrip.name)
     private readonly busTripModel: Model<BusTripDocument>,
     private readonly busRouteStopService: BusRouteStopService,
     private readonly busLocationService: BusLocationService,
     private readonly busTripService: BusTripService,
-  ) { }
+    private readonly redisService: RedisService,
+  ) {}
 
-  onModuleInit(): void {
-    this.start();
+  async onModuleInit(): Promise<void> {
+    await this.start();
   }
 
   onModuleDestroy(): void {
@@ -126,13 +97,29 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
   // ─── Public API ────────────────────────────────────────────────────────────
 
   /** Start the simulation loop. No-op if already running. */
-  start(): void {
+  async start(): Promise<void> {
     if (this._running) return;
+
+    // Acquire a distributed lock so only one instance runs the simulation.
+    // On single-instance deploys this is a no-op; on multi-instance it prevents
+    // duplicate simulations that would advance buses 2×/3× too fast.
+    const acquired = await this.redisService.setnx(
+      BusSimulationService.LOCK_KEY,
+      this.instanceId,
+      SIM_LOCK_TTL_SECONDS,
+    );
+    if (!acquired) {
+      this.logger.warn(
+        `Simulation lock held by another instance — this instance (${this.instanceId}) will not start.`,
+      );
+      return;
+    }
+
     this._running = true;
     this.tickCount = 0;
     this.intervalHandle = setInterval(() => void this.runTick(), TICK_MS);
     this.logger.log(
-      `Simulation started — tick=${TICK_MS} ms, speed=${BUS_SPEED_KMH} km/h (${SPEED_M_PER_TICK.toFixed(1)} m/tick)`,
+      `Simulation started (instance=${this.instanceId}) — tick=${TICK_MS} ms, speed=${BUS_SIMULATION_SPEED_KMH} km/h (${SIMULATION_SPEED_M_PER_TICK.toFixed(1)} m/tick)`,
     );
   }
 
@@ -144,6 +131,8 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
     this.intervalHandle = null;
     this.trips.clear();
     this.routeStopCache.clear();
+    // Release the distributed lock so another instance can take over.
+    void this.redisService.del(BusSimulationService.LOCK_KEY);
     this.logger.log('Simulation stopped');
   }
 
@@ -182,8 +171,15 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
   /**
    * Pull the current `in-progress` trip list from DB.
    * Evict trips that are no longer active; initialise any that are new.
+   * Also renews the distributed lock TTL so it doesn't expire mid-operation.
    */
   private async syncActiveTrips(): Promise<void> {
+    // Renew lock — fire-and-forget so a slow Redis call can't freeze the tick.
+    // The TTL is 30 s and syncs happen every 5 s, so one missed renewal is safe.
+    this.redisService
+      .expire(BusSimulationService.LOCK_KEY, SIM_LOCK_TTL_SECONDS)
+      .catch((err: unknown) => this.logger.warn('Lock renewal failed', err));
+
     const active = await this.busTripModel
       .find({ status: 'in-progress' })
       .lean()
@@ -237,7 +233,7 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
     // Treat live data as stale if indices are out-of-bounds (e.g. after a reset)
     const isStale = !live || live.nextStopIndex >= stops.length;
 
-    let pos: [number, number];
+    let pos: Coords;
     let currentStopIdx: number;
     let nextStopIdx: number;
     let passengerCount: number;
@@ -255,7 +251,7 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
         passengerCount,
         longitude: pos[0],
         latitude: pos[1],
-        ...meta
+        ...meta,
       });
     } else {
       pos = [live.longitude, live.latitude];
@@ -264,17 +260,25 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
       passengerCount = live.passengerCount;
     }
 
+    const segmentCoords = this.buildSegmentCoords(stops, nextStopIdx, pos);
+    // When resuming mid-segment from Redis, find the waypoint the bus was
+    // actually heading toward — not always waypoint[1]. Without this, the bus
+    // would move BACKWARD through already-passed waypoints before continuing
+    // forward, appearing frozen or going the wrong direction on the frontend.
+    const waypointIdx = isStale
+      ? 1
+      : this.findResumeWaypointIdx(pos, segmentCoords);
+
     this.trips.set(tripId, {
       tripId,
       busId: String(trip.bus),
-      routeId: String(trip.route),
-      pos: pos as [number, number],
+      routeId,
+      pos,
       currentStopIdx,
       nextStopIdx,
       passengerCount,
-      waypointIdx: 1,
-      segmentCoords: this.buildSegmentCoords(stops, nextStopIdx, pos as [number, number]),
-      currentPos: pos as [number, number],
+      waypointIdx,
+      segmentCoords,
     });
 
     this.logger.verbose(
@@ -291,30 +295,47 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
     const stops = this.routeStopCache.get(state.routeId);
     if (!stops) return;
 
-    const oldPos = [...state.pos] as [number, number];
-
     if (state.nextStopIdx >= stops.length) {
       await this.completeTrip(state, stops);
       return;
     }
 
-    // Move the bus along the waypoint chain by SPEED_M_PER_TICK metres
-    let { pos, waypointIdx } = state;
-    const { segmentCoords } = state;
-    let remaining = SPEED_M_PER_TICK;
+    // Move the bus along the waypoint chain by SIMULATION_SPEED_M_PER_TICK metres.
+    // When the bus exhausts a segment it snaps to the stop and immediately continues
+    // on the next segment with whatever distance remains — no movement is lost.
+    let pos = state.pos;
+    let waypointIdx = state.waypointIdx;
+    let segCoords = state.segmentCoords;
+    let remaining = SIMULATION_SPEED_M_PER_TICK;
 
-    while (remaining > 0) {
-      if (waypointIdx >= segmentCoords.length) {
-        await this.arriveAtStop(state, stops);
-        return;
+    while (remaining > 0.01) {
+      if (waypointIdx >= segCoords.length) {
+        // Bus has consumed the entire waypoint chain — arrived at the next stop.
+        const arrivedIdx = state.nextStopIdx;
+        const newNextIdx = arrivedIdx + 1;
+
+        if (newNextIdx >= stops.length) {
+          // Last stop reached — commit position and reset trip.
+          state.pos = pos;
+          state.currentStopIdx = arrivedIdx;
+          state.nextStopIdx = newNextIdx;
+          state.waypointIdx = waypointIdx;
+          state.segmentCoords = segCoords;
+          await this.completeTrip(state, stops);
+          return;
+        }
+
+        // Snap to stop and load the next inter-stop segment.
+        pos = stopCoords(stops[arrivedIdx].stop);
+        state.currentStopIdx = arrivedIdx;
+        state.nextStopIdx = newNextIdx;
+        segCoords = this.buildSegmentCoords(stops, newNextIdx, pos);
+        waypointIdx = 1;
+        // The remaining distance is consumed on the new segment — loop continues.
+        continue;
       }
 
-      const heading = this.headingFromState(segmentCoords, pos, waypointIdx);
-      const busImage = pos[0] < oldPos[0] ? 'bus_go_left.png' : 'bus_go_right.png';
-
-      state.pos = pos;
-      state.waypointIdx = waypointIdx; 
-      const target = segmentCoords[waypointIdx];
+      const target = segCoords[waypointIdx];
       const dist = haversineMeters(pos, target);
 
       if (dist <= remaining) {
@@ -333,10 +354,11 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
-    const heading = this.headingFromState(segmentCoords, pos, waypointIdx);
+    const heading = this.headingFromState(segCoords, pos, waypointIdx);
 
     state.pos = pos;
     state.waypointIdx = waypointIdx;
+    state.segmentCoords = segCoords;
     const meta = this.getLiveMetadata(pos);
 
     // Publish to Redis
@@ -359,48 +381,10 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
         longitude: pos[0],
         latitude: pos[1],
         heading,
-        speed: Math.round(BUS_SPEED_KMH),
+        speed: Math.round(BUS_SIMULATION_SPEED_KMH),
+        currentStopIndex: state.currentStopIdx,
       })
       .catch((err: unknown) => this.logger.error('reportLocation failed', err));
-  }
-
-  /** Snap bus to the arrived stop, then load the next segment. */
-  private async arriveAtStop(
-    state: TripSimState,
-    stops: BusRouteStop[],
-  ): Promise<void> {
-    const newCurrentStopIdx = state.nextStopIdx;
-    const newNextStopIdx = newCurrentStopIdx + 1;
-
-    if (newNextStopIdx >= stops.length) {
-      state.currentStopIdx = newCurrentStopIdx;
-      state.nextStopIdx = newNextStopIdx;
-      await this.completeTrip(state, stops);
-      return;
-    }
-
-    const stopPos = stopCoords(stops[newCurrentStopIdx].stop);
-    state.currentPos = stopPos;
-
-    state.currentStopIdx = newCurrentStopIdx;
-    state.nextStopIdx = newNextStopIdx;
-
-    state.segmentCoords = this.buildSegmentCoords(stops, newNextStopIdx, stopPos);
-    state.waypointIdx = 1;
-
-    const prevPos = state.currentPos;
-    const pos = state.segmentCoords[state.waypointIdx];
-    state.currentPos = pos;
-
-    await this.busTripService.setLiveData(state.tripId, {
-      currentStopIndex: newCurrentStopIdx,
-      nextStopIndex: newNextStopIdx,
-      passengerCount: state.passengerCount,
-      longitude: pos[0],
-      latitude: pos[1],
-      heading: 0,
-      busImage: pos[0] < (prevPos?.[0] ?? pos[0]) ? 'bus_go_left.png' : 'bus_go_right.png',
-    });
   }
 
   /** Reset the trip to `scheduled`, clear Redis live data, and evict from memory. */
@@ -419,16 +403,39 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
     state.passengerCount = 0;
     state.segmentCoords = this.buildSegmentCoords(stops, nextStopIdx, pos);
 
-    const meta = this.getLiveMetadata(pos);
-
-    await this.busTripService.setLiveData(state.tripId, {
+    // Use writeWithTimeout so a hanging Redis connection cannot freeze all buses
+    // at the loop-back point. The in-memory state is already reset above.
+    await this.writeWithTimeout(state.tripId, {
       currentStopIndex: 0,
       nextStopIndex: nextStopIdx,
       passengerCount: 0,
       longitude: pos[0],
       latitude: pos[1],
-      ...meta,
+      heading: 0,
+      busImage: '',
     });
+
+    // Publish the new position to bus:trip:{tripId}:location and the geo set
+    // so getLivePositionsByRoute() immediately sees the bus at stop[0].
+    // Without this, the routing ETA query reads stale coordinates from before
+    // the loop and computes wrong ETAs for all stops.
+    // Reuse state.segmentCoords already computed above — no need to rebuild.
+    const heading =
+      stops.length > 1 ? this.headingFromState(state.segmentCoords, pos, 1) : 0;
+    this.busLocationService
+      .reportLocation({
+        busId: state.busId,
+        tripId: state.tripId,
+        routeId: state.routeId,
+        longitude: pos[0],
+        latitude: pos[1],
+        heading,
+        speed: Math.round(BUS_SIMULATION_SPEED_KMH),
+        currentStopIndex: 0,
+      })
+      .catch((err: unknown) =>
+        this.logger.error('reportLocation failed on loop', err),
+      );
 
     this.logger.log(`Trip ${state.tripId} completed — looping back to start`);
   }
@@ -437,8 +444,8 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
 
   /** Calculate heading based on the next waypoint, or the last segment direction. */
   private headingFromState(
-    coords: [number, number][],
-    pos: [number, number],
+    coords: Coords[],
+    pos: Coords,
     waypointIdx: number,
   ): number {
     if (waypointIdx < coords.length) {
@@ -465,32 +472,92 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * Given the bus's current GPS position and the segment waypoint chain,
+   * returns the index of the NEXT waypoint the bus should target.
+   * Used when resuming from Redis to avoid forcing the bus backward through
+   * waypoints it has already passed.
+   */
+  private findResumeWaypointIdx(pos: Coords, segCoords: Coords[]): number {
+    if (segCoords.length <= 1) return 1;
+    let bestIdx = 1;
+    let minDist = Infinity;
+    for (let i = 0; i < segCoords.length - 1; i++) {
+      const d = pointToSegmentDistance(pos, segCoords[i], segCoords[i + 1]);
+      if (d < minDist) {
+        minDist = d;
+        bestIdx = i + 1; // target the end-point of the closest sub-segment
+      }
+    }
+    return bestIdx;
+  }
+
+  /**
+   * Write live position to Redis with a hard timeout so a hanging Redis
+   * connection never keeps `this.processing = true` indefinitely.
+   * If the write fails or times out, the bus state is already updated in
+   * memory and Redis will catch up on the next successful tick.
+   */
+  private async writeWithTimeout(
+    tripId: string,
+    liveData: TripLiveData,
+  ): Promise<void> {
+    let handle: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        this.busTripService.setLiveData(tripId, liveData),
+        new Promise<never>(
+          (_, reject) =>
+            (handle = setTimeout(
+              () => reject(new Error('Redis write timeout')),
+              2_000,
+            )),
+        ),
+      ]);
+    } catch (err) {
+      this.logger.warn(
+        `Redis write skipped for trip ${tripId} — will retry next tick`,
+        err,
+      );
+    } finally {
+      clearTimeout(handle);
+    }
+  }
+
+  /**
    * Build the waypoint chain from `currentPos` to stop at `nextStopIdx`.
    * Uses the stored road geometry (`segmentPath`) if available; falls back to
    * a straight two-point line.
+   *
+   * Data convention (matches what `TransitRoutingService.buildRaptorBusSegment`
+   * assumes): `stops[i].segmentPath` is the road geometry from stop `i-1` to
+   * stop `i` — the segment ARRIVING at this stop. To travel from the current
+   * stop to `nextStopIdx`, we therefore read `stops[nextStopIdx].segmentPath`.
    */
   private buildSegmentCoords(
     stops: BusRouteStop[],
     nextStopIdx: number,
-    currentPos: [number, number],
-  ): [number, number][] {
+    currentPos: Coords,
+  ): Coords[] {
     if (nextStopIdx >= stops.length) return [currentPos];
 
     const seg = stops[nextStopIdx].segmentPath;
     if (seg?.coordinates && seg.coordinates.length >= 2) {
-      return seg.coordinates as unknown as [number, number][];
+      return seg.coordinates as unknown as Coords[];
     }
 
     return [currentPos, stopCoords(stops[nextStopIdx].stop)];
   }
 
-  private getLiveMetadata(currentPos: [number, number], prevPos?: [number, number]) {
+  private getLiveMetadata(
+    currentPos: [number, number],
+    prevPos?: [number, number],
+  ) {
     const lng = currentPos[0];
     const prevLng = prevPos ? prevPos[0] : lng;
 
     return {
       heading: 0,
-      busImage: lng < prevLng ? 'bus_go_left.png' : 'bus_go_right.png'
+      busImage: lng < prevLng ? 'bus_go_left.png' : 'bus_go_right.png',
     };
   }
 }
