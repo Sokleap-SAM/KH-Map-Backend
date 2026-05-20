@@ -86,6 +86,22 @@ export const SYNC_EVERY_N_TICKS = 5;
  * expires mid-operation on a healthy instance.
  */
 export const SIM_LOCK_TTL_SECONDS = 30;
+
+/**
+ * Minimum interval between persisted bus_location documents per trip.
+ * Redis still updates every tick (cheap, used by live-ETA queries); the
+ * MongoDB write — which historically inserted a new document every second
+ * per active bus and bloated the cluster — is throttled to once per this
+ * interval, and uses upsert-by-trip so each trip occupies exactly one doc.
+ */
+export const BUS_LOCATION_DB_WRITE_INTERVAL_MS = 300_000; // 5 minutes
+
+/**
+ * TTL (seconds) for bus_location documents in MongoDB. Combined with the
+ * upsert pattern, active trips keep their `recordedAt` fresh and never
+ * expire; trips that go quiet (crashed simulator, paused service) age out.
+ */
+export const BUS_LOCATION_TTL_SECONDS = 6 * 60 * 60;
 // ─── Runtime / Routing config ───────────────────────────────────────────────
 
 /** Network cache TTL in milliseconds (used by TransitRoutingService) */

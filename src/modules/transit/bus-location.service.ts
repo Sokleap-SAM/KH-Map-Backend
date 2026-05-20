@@ -4,9 +4,8 @@ import { Model, Types } from 'mongoose';
 import { RedisService } from '../../shared/redis/redis.service';
 import { BusLocation } from './entities/bus-location.schema';
 import { ReportBusLocationDto } from './dto/report-bus-location.dto';
-
-/** TTL for bus location data in Redis — slightly longer than MAX_LOCATION_AGE_MS */
-const BUS_LOCATION_TTL_SECONDS = 360; // 6 minutes
+import { BUS_LOCATION_DB_WRITE_INTERVAL_MS } from '../../shared/constants/constants';
+import { BUS_LOCATION_TTL_SECONDS } from '../../shared/constants/constants';
 
 /** Redis key: latest ping metadata per trip */
 const tripKey = (tripId: string) => `bus:trip:${tripId}:location`;
@@ -27,25 +26,25 @@ export interface LiveBusPosition {
 
 @Injectable()
 export class BusLocationService {
+  /**
+   * Per-trip timestamp of the last MongoDB write, used to throttle
+   * persistence. Redis writes happen every tick regardless. Memory
+   * footprint is bounded by the number of active trips.
+   */
+  private readonly lastDbWriteAt = new Map<string, number>();
+
   constructor(
     @InjectModel(BusLocation.name)
     private readonly busLocationModel: Model<BusLocation>,
     private readonly redisService: RedisService,
   ) {}
 
-  async reportLocation(dto: ReportBusLocationDto): Promise<BusLocation> {
+  async reportLocation(dto: ReportBusLocationDto): Promise<BusLocation | null> {
     const now = new Date();
 
-    const doc = await this.busLocationModel.create({
-      bus: new Types.ObjectId(dto.busId),
-      trip: new Types.ObjectId(dto.tripId),
-      route: new Types.ObjectId(dto.routeId),
-      location: { type: 'Point', coordinates: [dto.longitude, dto.latitude] },
-      heading: dto.heading ?? null,
-      speed: dto.speed ?? null,
-      recordedAt: now,
-    });
-
+    // Redis is updated on EVERY call — live ETAs and the route geo set
+    // depend on this being fresh. Redis writes are cheap and bounded
+    // by their TTL, so no throttle needed here.
     const payload: LiveBusPosition = {
       tripId: dto.tripId,
       routeId: dto.routeId,
@@ -77,7 +76,35 @@ export class BusLocationService {
         ),
     ]);
 
-    return doc;
+    // Throttle MongoDB persistence. The simulation ticks every second; without
+    // throttling that was inserting thousands of documents per bus per hour.
+    // We persist at most every BUS_LOCATION_DB_WRITE_INTERVAL_MS, and we
+    // upsert by trip so each trip occupies exactly one document that is
+    // rewritten in place — old positions for the same bus disappear
+    // automatically when the new one is written.
+    const lastWrite = this.lastDbWriteAt.get(dto.tripId) ?? 0;
+    if (Date.now() - lastWrite < BUS_LOCATION_DB_WRITE_INTERVAL_MS) {
+      return null;
+    }
+    this.lastDbWriteAt.set(dto.tripId, Date.now());
+
+    return this.busLocationModel.findOneAndUpdate(
+      { trip: new Types.ObjectId(dto.tripId) },
+      {
+        $set: {
+          bus: new Types.ObjectId(dto.busId),
+          route: new Types.ObjectId(dto.routeId),
+          location: {
+            type: 'Point',
+            coordinates: [dto.longitude, dto.latitude],
+          },
+          heading: dto.heading ?? null,
+          speed: dto.speed ?? null,
+          recordedAt: now,
+        },
+      },
+      { upsert: true, new: true },
+    );
   }
 
   async getLivePosition(tripId: string): Promise<LiveBusPosition | null> {
