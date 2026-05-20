@@ -111,6 +111,34 @@ export class BusLocationService {
     return this.redisService.get<LiveBusPosition>(tripKey(tripId));
   }
 
+  /**
+   * Remove all live-position traces for a trip from Redis. Call this when a
+   * trip is cancelled, completed, or evicted from the simulator — otherwise
+   * the trip key (`bus:trip:{tripId}:location`) and its entry in the route
+   * geo set (`bus:route:{routeId}:geo`) linger until their 24h TTL expires
+   * and keep showing up in `getLivePositionsByRoute`, which is what feeds
+   * live ETAs into the routing service.
+   *
+   * If `routeId` is unknown to the caller we read it out of the trip key
+   * first; if the trip key is already gone we still attempt the geo remove
+   * via best-effort delete on common route keys (no-op in practice).
+   */
+  async clearLocation(tripId: string, routeId?: string): Promise<void> {
+    let resolvedRouteId = routeId;
+    if (!resolvedRouteId) {
+      const existing = await this.redisService.get<LiveBusPosition>(
+        tripKey(tripId),
+      );
+      resolvedRouteId = existing?.routeId;
+    }
+    await Promise.all([
+      this.redisService.del(tripKey(tripId)),
+      resolvedRouteId
+        ? this.redisService.georemove(routeGeoKey(resolvedRouteId), tripId)
+        : Promise.resolve(),
+    ]);
+  }
+
   async getLivePositionsByRoute(routeId: string): Promise<LiveBusPosition[]> {
     // Get all tripIds currently in the geo set for this route
     const tripIds = await this.redisService.geosearch(

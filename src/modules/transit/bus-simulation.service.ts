@@ -187,10 +187,24 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
 
     const activeIds = new Set(active.map((t) => String(t._id)));
 
-    // Evict trips no longer in-progress
+    // Evict trips no longer in-progress, and clean their Redis live-position
+    // keys so `getLivePositionsByRoute` stops returning them — otherwise the
+    // routing service keeps treating the bus as live for up to 24 h after the
+    // trip is removed from Mongo.
     for (const id of this.trips.keys()) {
       if (!activeIds.has(id)) {
+        const evicted = this.trips.get(id);
         this.trips.delete(id);
+        if (evicted) {
+          this.busLocationService
+            .clearLocation(id, evicted.routeId)
+            .catch((err: unknown) =>
+              this.logger.warn(
+                `Failed to clear Redis location for trip ${id}`,
+                err,
+              ),
+            );
+        }
         this.logger.verbose(`Evicted trip ${id}`);
       }
     }

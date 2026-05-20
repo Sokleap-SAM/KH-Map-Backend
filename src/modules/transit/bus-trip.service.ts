@@ -13,6 +13,7 @@ import { BusTrip, BusTripDocument } from './entities/bus-trip.schema';
 import { CreateBusTripDto } from './dto/create-bus-trip.dto';
 import { UpdateBusTripDto } from './dto/update-bus-trip.dto';
 import { BusRouteStopService } from './bus-route-stop.service';
+import { BusLocationService } from './bus-location.service';
 import { RedisService } from '../../shared/redis/redis.service';
 
 // Redis key conventions:
@@ -40,6 +41,7 @@ export class BusTripService {
     @InjectModel(BusTrip.name)
     private readonly busTripModel: Model<BusTripDocument>,
     private readonly busRouteStopService: BusRouteStopService,
+    private readonly busLocationService: BusLocationService,
     private readonly redisService: RedisService,
   ) {}
 
@@ -85,6 +87,11 @@ export class BusTripService {
   async clearLiveData(tripId: string): Promise<void> {
     await this.redisService.hdel(this.tripLiveKey(tripId));
     await this.redisService.georemove(this.GEO_KEY, tripId);
+    // Also clear bus-location's namespace (separate keys consumed by the
+    // routing service's `getLivePositionsByRoute`). Without this, ending a
+    // trip via the API only cleans this service's keys and the routing layer
+    // continues to see the bus as live until the 24h Redis TTL expires.
+    await this.busLocationService.clearLocation(tripId);
   }
 
   private async mergeLiveData(trip: any, live: TripLiveData | null) {
