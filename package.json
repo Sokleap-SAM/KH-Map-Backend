@@ -21,7 +21,7 @@
   },
   "dependencies": {
     "@apollo/server": "^5.4.0",
-    "@nestjs-modules/mailer": "^2.3.4",
+    "@nestjs-modules/mailer": "^2.3.5",
     "@nestjs/cache-manager": "^3.1.0",
     "@nestjs/common": "^11.0.1",
     "@nestjs/config": "^4.0.3",
@@ -45,8 +45,6 @@
     "mqtt": "^5.15.0",
     "multer": "^2.1.1",
     "multer-storage-cloudinary": "^4.0.0",
-    "nodemailer": "^8.0.5",
-    "passport": "^0.7.0",
     "passport-jwt": "^4.0.1",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2"

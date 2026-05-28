@@ -34,6 +34,41 @@ services:
     networks:
       - bus_net
 
+  valhalla:
+    image: ghcr.io/gis-ops/docker-valhalla/valhalla:latest
+    container_name: bus_valhalla
+    ports:
+      - "${VALHALLA_PORT}:8002"
+    volumes:
+      # Persists built tiles so they survive container restarts.
+      # On first run, Valhalla will auto-build tiles from any .osm.pbf
+      # files it finds inside /custom_files. Drop your Cambodia PBF there.
+      # Download from: https://download.geofabrik.de/asia/cambodia-latest.osm.pbf
+      - ./valhalla/custom_files:/custom_files
+      - valhalla_tiles:/valhalla/tiles
+    environment:
+      # Build tiles automatically if none exist yet
+      - tile_urls=
+      # Use the PBF files in /custom_files instead of downloading
+      - use_tiles_ignore_pbf=False
+      - force_rebuild=False
+      # Pedestrian-focused: keep all costing models but pedestrian is default
+      - build_elevation=False
+      - build_admins=True
+      - build_time_zones=True
+    healthcheck:
+      # Valhalla's /status endpoint returns 200 once tiles are ready
+      test: ["CMD", "wget", "-qO-", "http://localhost:8002/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 120s   # tile building can take a few minutes on first run
+    networks:
+      - bus_net
+
+volumes:
+  valhalla_tiles:
+
 networks:
   bus_net:
     driver: bridge
