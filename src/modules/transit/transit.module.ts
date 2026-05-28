@@ -17,7 +17,7 @@ import { BusTripService } from './bus-trip.service';
 import { BusLocationService } from './bus-location.service';
 // import { TransitRoutingService } from './transit-routing.service';
 import { BusSimulationService } from './bus-simulation.service';
-import { OsrmService } from './osrm.service';
+// import { OsrmService } from './osrm.service';
 
 @Module({
   imports: [
@@ -39,7 +39,7 @@ import { OsrmService } from './osrm.service';
     BusLocationService,
     // TransitRoutingService,
     BusSimulationService,
-    OsrmService,
+    // OsrmService,
   ],
   exports: [
     BusRouteService,
