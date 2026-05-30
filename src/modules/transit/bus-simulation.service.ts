@@ -99,8 +99,15 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
     private readonly mqttService: MqttService,
   ) {}
 
+  /** Tracks whether the caller wants the simulator running, even if start
+   *  hasn't actually succeeded yet (e.g. waiting for Redis to come up). */
+  private wantedRunning = false;
+  private startRetryHandle: ReturnType<typeof setTimeout> | null = null;
+
   async onModuleInit(): Promise<void> {
-    await this.start();
+    // Don't await — start() may schedule retries (Redis warming up) and we
+    // mustn't block the Nest bootstrap on that.
+    void this.start();
   }
 
   onModuleDestroy(): void {
@@ -109,22 +116,66 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
 
   // ─── Public API ────────────────────────────────────────────────────────────
 
-  /** Start the simulation loop. No-op if already running. */
+  /**
+   * Start the simulation loop. No-op if already running. Safe to call before
+   * Redis is connected — the lock acquisition is retried until it succeeds
+   * (or {@link stop} cancels the intent).
+   */
   async start(): Promise<void> {
+    this.wantedRunning = true;
+    await this.attemptStart();
+  }
+
+  private async attemptStart(): Promise<void> {
+    if (!this.wantedRunning) return; // cancelled by stop() while retrying
     if (this._running) return;
 
     // Acquire a distributed lock so only one instance runs the simulation.
     // On single-instance deploys this is a no-op; on multi-instance it prevents
     // duplicate simulations that would advance buses 2×/3× too fast.
-    const acquired = await this.redisService.setnx(
-      BusSimulationService.LOCK_KEY,
-      this.instanceId,
-      SIM_LOCK_TTL_SECONDS,
-    );
-    if (!acquired) {
-      this.logger.warn(
-        `Simulation lock held by another instance — this instance (${this.instanceId}) will not start.`,
+    let acquired = false;
+    try {
+      acquired = await this.redisService.setnx(
+        BusSimulationService.LOCK_KEY,
+        this.instanceId,
+        SIM_LOCK_TTL_SECONDS,
       );
+    } catch (err) {
+      // Defensive — setnx already catches in RedisService, but keep this in
+      // case the underlying client throws synchronously during boot.
+      this.logger.warn(
+        `Simulation start: Redis error (${(err as Error).message}). Retrying in 5 s.`,
+      );
+    }
+
+    if (!acquired) {
+      // Two reasons we land here: Redis isn't ready yet (boot race) OR
+      // another instance owns the lock. Retry either way — when Redis comes
+      // up we'll get it; when the other instance dies its TTL will free it.
+      // Surface the lock holder + TTL when we can, so a stale lock from a
+      // crashed instance is obvious in the log instead of an opaque retry loop.
+      let detail = this.redisService.isReady()
+        ? 'lock held'
+        : 'Redis warming up';
+      if (this.redisService.isReady()) {
+        try {
+          const holder = await this.redisService.get<string>(
+            BusSimulationService.LOCK_KEY,
+          );
+          detail = holder
+            ? `lock held by instance=${holder}`
+            : 'lock held (holder unknown)';
+        } catch {
+          // ignore — log the original reason
+        }
+      }
+      this.logger.warn(
+        `Simulation start deferred (${detail}, this instance=${this.instanceId}). Retrying in 5 s.`,
+      );
+      this.startRetryHandle = setTimeout(() => {
+        this.startRetryHandle = null;
+        void this.attemptStart();
+      }, 5_000);
       return;
     }
 
@@ -138,6 +189,12 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
 
   /** Stop the loop and clear all in-memory state. No-op if already stopped. */
   stop(): void {
+    // Cancel any pending start retry first so we don't undo this stop.
+    this.wantedRunning = false;
+    if (this.startRetryHandle) {
+      clearTimeout(this.startRetryHandle);
+      this.startRetryHandle = null;
+    }
     if (!this._running) return;
     this._running = false;
     clearInterval(this.intervalHandle!);

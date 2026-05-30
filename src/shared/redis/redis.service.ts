@@ -186,20 +186,37 @@ export class RedisService {
 
   /**
    * Set a plain string key only if it does not already exist (NX).
-   * Returns true if the key was set (lock acquired), false if it already existed.
+   * Returns true if the key was set (lock acquired), false otherwise — either
+   * because the key already existed OR because Redis was unreachable.
+   * Callers that need to distinguish those (e.g. retry vs. step aside) should
+   * check `isReady()` before / after.
    */
   async setnx(
     key: string,
     value: string,
     ttlSeconds: number,
   ): Promise<boolean> {
-    const result = await this.redisClient.set(
-      key,
-      value,
-      'EX',
-      ttlSeconds,
-      'NX',
-    );
-    return result === 'OK';
+    try {
+      const result = await this.redisClient.set(
+        key,
+        value,
+        'EX',
+        ttlSeconds,
+        'NX',
+      );
+      return result === 'OK';
+    } catch (err) {
+      this.warnUnavailable('setnx', err);
+      return false;
+    }
+  }
+
+  /**
+   * Whether the underlying ioredis client is currently connected and ready to
+   * accept commands. Useful for callers that need to retry until the
+   * connection comes up (e.g. simulator start at boot).
+   */
+  isReady(): boolean {
+    return this.redisClient.status === 'ready';
   }
 }
