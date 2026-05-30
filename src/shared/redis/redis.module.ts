@@ -20,8 +20,9 @@ import { RedisService, REDIS_CLIENT } from './redis.service';
           // Fail fast when Redis is unreachable so HTTP handlers don't block
           // on the default 20-retry loop. RedisService catches the resulting
           // errors and returns safe defaults.
-          maxRetriesPerRequest: 1,
-          enableOfflineQueue: false,
+          tls: host.includes('localhost') ? undefined : {},
+          maxRetriesPerRequest: null,
+          enableOfflineQueue: true,
           retryStrategy: (times) => Math.min(times * 1000, 30_000),
         });
         // ioredis emits 'error' for every reconnect attempt; without a
