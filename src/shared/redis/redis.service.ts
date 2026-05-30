@@ -65,6 +65,34 @@ export class RedisService {
     }
   }
 
+  /**
+   * Delete every key matching a glob pattern, in batches. Uses SCAN to avoid
+   * blocking Redis on `KEYS *`-style queries against a large keyspace.
+   * Intended for dev/admin resets — not a hot-path operation.
+   */
+  async deleteByPattern(pattern: string): Promise<number> {
+    let cursor = '0';
+    let deleted = 0;
+    try {
+      do {
+        const [next, keys] = await this.redisClient.scan(
+          cursor,
+          'MATCH',
+          pattern,
+          'COUNT',
+          200,
+        );
+        cursor = next;
+        if (keys.length > 0) {
+          deleted += await this.redisClient.del(...keys);
+        }
+      } while (cursor !== '0');
+    } catch (err) {
+      this.warnUnavailable('deleteByPattern', err);
+    }
+    return deleted;
+  }
+
   // ─── Hash operations ───────────────────────────────────────
 
   async hset(key: string, data: Record<string, string>): Promise<void> {

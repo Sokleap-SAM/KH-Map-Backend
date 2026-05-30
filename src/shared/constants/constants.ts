@@ -15,33 +15,6 @@ export const TRANSFER_WALK_RADIUS_GROWTH_PER_ROUND_M = 500;
 /** Hard cap for transfer walk radius (meters) in later RAPTOR rounds. */
 export const TRANSFER_WALK_MAX_RADIUS_M = 3000;
 
-/** Backward-compatible alias for existing callers expecting a single transfer radius. */
-export const TRANSFER_WALK_RADIUS_M = TRANSFER_WALK_BASE_RADIUS_M;
-
-export const RIVER_THRESHOLD_MIN = 5; // b1 > this triggers expansion
-
-export const RIVER_EXPAND_BASE_RADIUS_M = 800; // starting search radius
-
-export const RIVER_EXPAND_MAX_RADIUS_M = 3000; // cap on expansion
-
-export const RIVER_EXPAND_CANDIDATE_CAP = 6;
-
-/**
- * Max walking distance (meters) for the final walk from alight stop to destination.
- * Candidate alight stops beyond this distance are skipped unless no closer stop exists.
- * Mirrors MAX_ORIGIN_WALK_M logic: cap only applies when a closer stop is available.
- */
-export const MAX_DEST_WALK_M = 1000;
-
-/**
- * Max walking distance (meters) to seed a stop from origin in RAPTOR round 0.
- * Stops beyond this distance are NOT pre-seeded; they must be discovered
- * through transfers from nearby routes. This is critical for multi-transfer
- * journeys: if all routes are force-seeded in round 0, RAPTOR can never
- * produce a 2-leg transfer option because everything is found in round 1.
- */
-export const MAX_ORIGIN_WALK_M = 1000;
-
 /** Time penalty (minutes) added when transferring between routes */
 export const TRANSFER_PENALTY_MIN = 2;
 
@@ -62,7 +35,12 @@ export const MIN_WAIT_MIN = 1;
  */
 export const TRANSFER_UNCERTAINTY_BUFFER_MIN = 5;
 
-/** Dwell time (minutes) added per stop for boarding/alighting delay (25 s) */
+/**
+ * Dwell time (minutes) the bus is stationary at each intermediate stop while
+ * passengers board and alight. Added to per-segment cost in routing so ETAs
+ * stop systematically under-promising on long rides, and enforced in the
+ * simulator so the on-map bus matches what the routing engine predicts.
+ */
 export const DWELL_TIME_MIN = 25 / 60;
 
 // ─── Bus Simulation ───────────────────────────────────────────────────────────
@@ -79,6 +57,15 @@ export const SIMULATION_SPEED_M_PER_TICK =
 
 /** Re-sync active-trip list from MongoDB every N ticks */
 export const SYNC_EVERY_N_TICKS = 5;
+
+/**
+ * Haversine distance (meters) within which the simulated bus is considered
+ * to have arrived at its next stop. The simulator advances along the
+ * segmentPath waypoints, but the last waypoint isn't always exactly at the
+ * stop's stored coordinates — without this threshold the bus can sit ~10 m
+ * short of the stop and never load the next segment. ±5 m snaps it cleanly.
+ */
+export const STOP_ARRIVAL_RADIUS_M = 5;
 
 /**
  * TTL (seconds) for the simulation distributed-lock key in Redis.
@@ -102,10 +89,38 @@ export const BUS_LOCATION_DB_WRITE_INTERVAL_MS = 300_000; // 5 minutes
  * expire; trips that go quiet (crashed simulator, paused service) age out.
  */
 export const BUS_LOCATION_TTL_SECONDS = 6 * 60 * 60;
+
+/**
+ * TTL (seconds) for the per-route "last departure from first stop" anchor in
+ * Redis. The routing service uses this anchor to project the next lap's
+ * arrival at any boarding stop as `anchor + headway + ridePrefix`, which is
+ * stable across requests (doesn't slide with wall-clock the way a pure
+ * "now + headway" projection does). Set generously so the anchor survives a
+ * quiet period or a restart; the simulator overwrites it on every lap.
+ */
+export const ROUTE_DEPARTURE_ANCHOR_TTL_SECONDS = 24 * 60 * 60;
+
 // ─── Runtime / Routing config ───────────────────────────────────────────────
 
-/** Network cache TTL in milliseconds (used by TransitRoutingService) */
+/** In-memory network cache TTL in milliseconds (used by TransitRoutingService) */
 export const NETWORK_CACHE_TTL_MS = 5 * 60 * 1000;
+
+/** Redis key for the persisted, pre-computed transit network snapshot. */
+export const NETWORK_CACHE_REDIS_KEY = 'transit:network:v1';
+
+/**
+ * TTL (seconds) for the Redis-backed network cache. Long because we invalidate
+ * explicitly on route/stop CRUD; the TTL is just a safety net so stale data
+ * eventually disappears if invalidation is missed (e.g. direct DB edit).
+ */
+export const NETWORK_CACHE_REDIS_TTL_SECONDS = 24 * 60 * 60;
+
+/**
+ * How many footpath sources to batch into a single Valhalla matrix call when
+ * building the network cache. Picked so each request stays under the
+ * ValhallaService timeout while keeping total HTTP overhead small.
+ */
+export const VALHALLA_FOOTPATH_SOURCE_BATCH = 50;
 
 /**
  * Live ETA cache TTL in milliseconds. Multiple plan requests within this window
@@ -121,15 +136,35 @@ export const LIVE_ETA_CACHE_TTL_MS = 15 * 1000;
  */
 export const TIE_DELTA_MIN = 2;
 
-/** Search radii steps (meters) used for origin/destination expansion attempts */
+/** Search radii steps (meters) used for origin expansion attempts */
 export const ORIGIN_RADII_M = [1000, 2000, 3000, Infinity];
-export const DEST_RADII_M = [1000, 2000, 3000, Infinity];
 
 /** Default RAPTOR max rounds */
 export const RAPTOR_MAX_ROUNDS = 4;
 
 /** Transfer penalty (minutes) used for ranking options (larger than TRANSFER_PENALTY_MIN) */
 export const TRANSFER_PENALTY_FOR_RANKING = 15;
+
+/**
+ * Slack (minutes) for the round-1 footpath improvement check. RAPTOR's strict
+ * `arrival < tauStar` comparison rejects transfers that are slightly worse than
+ * direct origin walks, so chains like "ride 2A → walk to 1A stop → ride 1A"
+ * never get explored when the user is far from the network and direct walks
+ * dominate every stop. Allowing footpaths within this slack to set a label
+ * (and update tauStar) surfaces these chains without exploding label count.
+ */
+export const FOOTPATH_RELAXATION_MIN = 5;
+
+/**
+ * How long (ms) a previously-returned transit option stays "sticky" — re-merged
+ * into subsequent plan responses even when it falls out of the candidate set.
+ * Bus simulation advances every tick, which shifts boarding ETAs and can flip
+ * borderline options across qualification thresholds. Without hysteresis the
+ * user sees an option appear, disappear, reappear within seconds. 60 s is long
+ * enough to absorb headway-rollover jitter and short enough that stale options
+ * don't linger.
+ */
+export const OPTION_HYSTERESIS_MS = 60_000;
 
 /** Threshold for flagging a long initial walk (meters) */
 export const LONG_WALK_WARNING_M = 1500;
