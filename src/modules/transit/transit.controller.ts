@@ -2,6 +2,7 @@ import {
   Body,
   Controller,
   Delete,
+  ForbiddenException,
   Get,
   Param,
   Patch,
@@ -24,6 +25,7 @@ import { UpdateBusTripDto } from './dto/update-bus-trip.dto';
 import { TransitRoutingService } from './transit-routing.service';
 import { BusLocationService } from './bus-location.service';
 import { BusSimulationService } from './bus-simulation.service';
+import { BusDispatchService } from './bus-dispatch.service';
 import { PlanRouteDto } from './dto/plan-route.dto';
 import { ReportBusLocationDto } from './dto/report-bus-location.dto';
 
@@ -37,6 +39,7 @@ export class TransitController {
     private readonly transitRoutingService: TransitRoutingService,
     private readonly busLocationService: BusLocationService,
     private readonly busSimulationService: BusSimulationService,
+    private readonly busDispatchService: BusDispatchService,
   ) {}
 
   // ─── Route Planning ────────────────────────────────────────
@@ -76,7 +79,7 @@ export class TransitController {
   @Post('routes')
   async createRoute(@Body() dto: CreateBusRouteDto) {
     const result = await this.busRouteService.create(dto);
-    this.transitRoutingService.invalidateNetworkCache();
+    await this.transitRoutingService.invalidateNetworkCache();
     return result;
   }
 
@@ -107,14 +110,14 @@ export class TransitController {
       new Types.ObjectId(id),
       dto,
     );
-    this.transitRoutingService.invalidateNetworkCache();
+    await this.transitRoutingService.invalidateNetworkCache();
     return result;
   }
 
   @Delete('routes/:id')
   async removeRoute(@Param('id') id: string) {
     const result = await this.busRouteService.remove(new Types.ObjectId(id));
-    this.transitRoutingService.invalidateNetworkCache();
+    await this.transitRoutingService.invalidateNetworkCache();
     return result;
   }
 
@@ -123,7 +126,7 @@ export class TransitController {
   @Post('route-stops')
   async createRouteStop(@Body() dto: CreateBusRouteStopDto) {
     const result = await this.busRouteStopService.create(dto);
-    this.transitRoutingService.invalidateNetworkCache();
+    await this.transitRoutingService.invalidateNetworkCache();
     return result;
   }
 
@@ -153,7 +156,7 @@ export class TransitController {
       new Types.ObjectId(id),
       dto,
     );
-    this.transitRoutingService.invalidateNetworkCache();
+    await this.transitRoutingService.invalidateNetworkCache();
     return result;
   }
 
@@ -162,7 +165,7 @@ export class TransitController {
     const result = await this.busRouteStopService.remove(
       new Types.ObjectId(id),
     );
-    this.transitRoutingService.invalidateNetworkCache();
+    await this.transitRoutingService.invalidateNetworkCache();
     return result;
   }
 
@@ -285,5 +288,35 @@ export class TransitController {
   stopSimulation() {
     this.busSimulationService.stop();
     return { running: this.busSimulationService.running };
+  }
+
+  // ─── Dispatch (dev only) ──────────────────────────────────────────────────
+
+  /**
+   * DEV ONLY: wipe every bus, trip, and bus-location record (Mongo) and the
+   * matching Redis keys, then clear the simulator's in-memory trip cache.
+   * Routes and route-stops are preserved — only the fleet is reset, so the
+   * dispatch service's bootstrap path runs fresh on the next sync.
+   *
+   * Refuses to run when `NODE_ENV === 'production'`. Useful in development
+   * after schema changes or to start over with a clean queue.
+   *
+   * POST /transit/dispatch/reset
+   */
+  @Post('dispatch/reset')
+  async resetDispatch() {
+    if (process.env.NODE_ENV === 'production') {
+      throw new ForbiddenException(
+        'Fleet reset is disabled in production. Run this in dev only.',
+      );
+    }
+    this.busSimulationService.clearInMemoryState();
+    const result = await this.busDispatchService.resetAllFleet();
+    return {
+      ok: true,
+      ...result,
+      message:
+        'Fleet wiped. Routes are intact; dispatch will bootstrap fresh buses on next sync.',
+    };
   }
 }

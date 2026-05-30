@@ -10,15 +10,19 @@ import { Model, Types } from 'mongoose';
 import { BusTrip, BusTripDocument } from './entities/bus-trip.schema';
 import { BusRouteStopService } from './bus-route-stop.service';
 import { BusLocationService } from './bus-location.service';
+import { BusDispatchService } from './bus-dispatch.service';
 import { BusTripService, TripLiveData } from './bus-trip.service';
 import { BusRouteStop } from './entities/bus-route-stop.schema';
 import { RedisService } from '../../shared/redis/redis.service';
+import { MqttService } from '../../shared/mqtt/mqtt.service';
 import {
   TICK_MS,
   BUS_SIMULATION_SPEED_KMH,
   SIMULATION_SPEED_M_PER_TICK,
   SYNC_EVERY_N_TICKS,
   SIM_LOCK_TTL_SECONDS,
+  STOP_ARRIVAL_RADIUS_M,
+  DWELL_TIME_MIN,
 } from '../../shared/constants/constants';
 import {
   Coords,
@@ -40,6 +44,13 @@ interface TripSimState {
   passengerCount: number;
   waypointIdx: number; // index into segmentCoords the bus is heading toward
   segmentCoords: Coords[]; // road waypoints for the current inter-stop segment
+  /**
+   * Wall-clock timestamp (ms) until which the bus is dwelling at its current
+   * stop and should not move. Set when the bus arrives at an intermediate
+   * stop so the on-map bus matches the dwell time baked into routing costs.
+   * Undefined when the bus is in motion.
+   */
+  dwellUntilMs?: number;
 }
 
 // ─── Geometry helpers ─────────────────────────────────────────────────────────
@@ -83,7 +94,9 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
     private readonly busRouteStopService: BusRouteStopService,
     private readonly busLocationService: BusLocationService,
     private readonly busTripService: BusTripService,
+    private readonly busDispatchService: BusDispatchService,
     private readonly redisService: RedisService,
+    private readonly mqttService: MqttService,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -144,6 +157,16 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
     return this.trips.size;
   }
 
+  /**
+   * DEV ONLY: drop every in-memory trip and route-stop cache entry so the
+   * simulator stops tracking any buses immediately. The next `syncActiveTrips`
+   * tick reads from a clean Mongo collection. Used by the admin reset endpoint.
+   */
+  clearInMemoryState(): void {
+    this.trips.clear();
+    this.routeStopCache.clear();
+  }
+
   // ─── Tick ──────────────────────────────────────────────────────────────────
 
   private async runTick(): Promise<void> {
@@ -152,8 +175,15 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
     this.tickCount++;
 
     try {
+      // Run trip sync in the background — a slow Mongo query mustn't block
+      // the per-tick bus advance. Worst case the simulator operates on the
+      // previous trip list for one extra tick (~1 s), which is invisible
+      // to clients; whereas an awaited sync that takes 3 s causes a visible
+      // 3 s freeze in every bus on the map.
       if (this.tickCount % SYNC_EVERY_N_TICKS === 1) {
-        await this.syncActiveTrips();
+        this.syncActiveTrips().catch((err: unknown) =>
+          this.logger.error('syncActiveTrips failed', err),
+        );
       }
       if (this.trips.size === 0) return;
       await Promise.all(
@@ -223,6 +253,13 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
     if (active.length > 0) {
       this.logger.debug(`Tracking ${this.trips.size}/${active.length} trips`);
     }
+
+    // Dispatch: bootstrap empty routes, promote scheduled trips after
+    // headway, and re-queue completed buses. Fire-and-forget so DB latency
+    // doesn't block the simulator sync.
+    this.busDispatchService
+      .run()
+      .catch((err: unknown) => this.logger.warn('Dispatch run failed', err));
   }
 
   /**
@@ -267,6 +304,16 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
         latitude: pos[1],
         ...meta,
       });
+      // Anchor the route's "last departure from first stop" to now so the
+      // routing service can project deterministic next-lap arrivals.
+      this.busLocationService
+        .setRouteDepartureAnchor(routeId, Date.now())
+        .catch((err: unknown) =>
+          this.logger.warn(
+            `Failed to set departure anchor for route ${routeId}`,
+            err,
+          ),
+        );
     } else {
       pos = [live.longitude, live.latitude];
       currentStopIdx = live.currentStopIndex;
@@ -314,61 +361,95 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
+    // Dwell handling: while the bus is dwelling at a stop it doesn't move,
+    // but we MUST keep publishing the stationary position every tick.
+    // Otherwise the frontend's MQTT stream goes silent and most clients drop
+    // the bus from the map after a few seconds, then "respawn" it when motion
+    // resumes — the visible disappearance bug.
+    if (state.dwellUntilMs && Date.now() >= state.dwellUntilMs) {
+      state.dwellUntilMs = undefined;
+    }
+    const isDwelling = state.dwellUntilMs !== undefined;
+
     // Move the bus along the waypoint chain by SIMULATION_SPEED_M_PER_TICK metres.
     // When the bus exhausts a segment it snaps to the stop and immediately continues
     // on the next segment with whatever distance remains — no movement is lost.
     let pos = state.pos;
     let waypointIdx = state.waypointIdx;
     let segCoords = state.segmentCoords;
-    let remaining = SIMULATION_SPEED_M_PER_TICK;
 
-    while (remaining > 0.01) {
-      if (waypointIdx >= segCoords.length) {
-        // Bus has consumed the entire waypoint chain — arrived at the next stop.
-        const arrivedIdx = state.nextStopIdx;
-        const newNextIdx = arrivedIdx + 1;
+    if (!isDwelling) {
+      let remaining = SIMULATION_SPEED_M_PER_TICK;
+      while (remaining > 0.01) {
+        // Arrival detection: if we're within STOP_ARRIVAL_RADIUS_M of the
+        // next stop's stored coordinates, treat as arrived and load the next
+        // segment. This handles the case where the segmentPath's last
+        // waypoint isn't exactly at the stop (data inconsistency) — without
+        // this check the bus can sit a few metres short of the stop and the
+        // segment-end branch below never triggers.
+        const nextStopCoords = stopCoords(stops[state.nextStopIdx].stop);
+        const distToNextStop = haversineMeters(pos, nextStopCoords);
+        const reachedByProximity = distToNextStop <= STOP_ARRIVAL_RADIUS_M;
+        const reachedByWaypoints = waypointIdx >= segCoords.length;
 
-        if (newNextIdx >= stops.length) {
-          // Last stop reached — commit position and reset trip.
-          state.pos = pos;
+        if (reachedByProximity || reachedByWaypoints) {
+          // Arrived at the next stop.
+          const arrivedIdx = state.nextStopIdx;
+          const newNextIdx = arrivedIdx + 1;
+
+          if (newNextIdx >= stops.length) {
+            // Last stop reached — commit position and reset trip.
+            state.pos = pos;
+            state.currentStopIdx = arrivedIdx;
+            state.nextStopIdx = newNextIdx;
+            state.waypointIdx = waypointIdx;
+            state.segmentCoords = segCoords;
+            await this.completeTrip(state, stops);
+            return;
+          }
+
+          // Snap to stop and start the dwell window. We don't consume the
+          // remaining tick budget on the next segment — doing so would skip
+          // dwell and let the bus outrun routing's predictions. Break out
+          // so the unified publish at the bottom still fires (Redis + MQTT)
+          // and the frontend sees the bus parked at the stop.
+          pos = nextStopCoords;
           state.currentStopIdx = arrivedIdx;
           state.nextStopIdx = newNextIdx;
-          state.waypointIdx = waypointIdx;
-          state.segmentCoords = segCoords;
-          await this.completeTrip(state, stops);
-          return;
+          segCoords = this.buildSegmentCoords(stops, newNextIdx, pos);
+          waypointIdx = 1;
+          state.dwellUntilMs = Date.now() + DWELL_TIME_MIN * 60_000;
+          break;
         }
 
-        // Snap to stop and load the next inter-stop segment.
-        pos = stopCoords(stops[arrivedIdx].stop);
-        state.currentStopIdx = arrivedIdx;
-        state.nextStopIdx = newNextIdx;
-        segCoords = this.buildSegmentCoords(stops, newNextIdx, pos);
-        waypointIdx = 1;
-        // The remaining distance is consumed on the new segment — loop continues.
-        continue;
-      }
+        const target = segCoords[waypointIdx];
+        const dist = haversineMeters(pos, target);
 
-      const target = segCoords[waypointIdx];
-      const dist = haversineMeters(pos, target);
-
-      if (dist <= remaining) {
-        // Reached this waypoint — continue toward the next
-        pos = target;
-        remaining -= dist;
-        waypointIdx++;
-      } else {
-        // Partial move toward this waypoint
-        const ratio = remaining / dist;
-        pos = [
-          pos[0] + (target[0] - pos[0]) * ratio,
-          pos[1] + (target[1] - pos[1]) * ratio,
-        ];
-        remaining = 0;
+        if (dist <= remaining) {
+          // Reached this waypoint — continue toward the next
+          pos = target;
+          remaining -= dist;
+          waypointIdx++;
+        } else {
+          // Partial move toward this waypoint
+          const ratio = remaining / dist;
+          pos = [
+            pos[0] + (target[0] - pos[0]) * ratio,
+            pos[1] + (target[1] - pos[1]) * ratio,
+          ];
+          remaining = 0;
+        }
       }
     }
 
-    const heading = this.headingFromState(segCoords, pos, waypointIdx);
+    // Heading is meaningless while dwelling (the bus isn't moving), so we
+    // publish 0; once dwell ends the next tick computes a real heading.
+    const heading = isDwelling
+      ? 0
+      : this.headingFromState(segCoords, pos, waypointIdx);
+    // Reported speed mirrors actual motion so live ETAs and the UI don't
+    // imply the bus is still moving while it dwells.
+    const reportedSpeed = isDwelling ? 0 : Math.round(BUS_SIMULATION_SPEED_KMH);
 
     state.pos = pos;
     state.waypointIdx = waypointIdx;
@@ -395,63 +476,73 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
         longitude: pos[0],
         latitude: pos[1],
         heading,
-        speed: Math.round(BUS_SIMULATION_SPEED_KMH),
+        speed: reportedSpeed,
         currentStopIndex: state.currentStopIdx,
       })
       .catch((err: unknown) => this.logger.error('reportLocation failed', err));
-  }
 
-  /** Reset the trip to `scheduled`, clear Redis live data, and evict from memory. */
-  private async completeTrip(
-    state: TripSimState,
-    stops: BusRouteStop[],
-  ): Promise<void> {
-    // Restart automatically from the first stop — no manual intervention needed.
-    const pos = stopCoords(stops[0].stop);
-    const nextStopIdx = stops.length > 1 ? 1 : 0;
-
-    state.pos = pos;
-    state.currentStopIdx = 0;
-    state.nextStopIdx = nextStopIdx;
-    state.waypointIdx = 1;
-    state.passengerCount = 0;
-    state.segmentCoords = this.buildSegmentCoords(stops, nextStopIdx, pos);
-
-    // Use writeWithTimeout so a hanging Redis connection cannot freeze all buses
-    // at the loop-back point. The in-memory state is already reset above.
-    await this.writeWithTimeout(state.tripId, {
-      currentStopIndex: 0,
-      nextStopIndex: nextStopIdx,
-      passengerCount: 0,
-      longitude: pos[0],
-      latitude: pos[1],
-      heading: 0,
-      busImage: '',
-    });
-
-    // Publish the new position to bus:trip:{tripId}:location and the geo set
-    // so getLivePositionsByRoute() immediately sees the bus at stop[0].
-    // Without this, the routing ETA query reads stale coordinates from before
-    // the loop and computes wrong ETAs for all stops.
-    // Reuse state.segmentCoords already computed above — no need to rebuild.
-    const heading =
-      stops.length > 1 ? this.headingFromState(state.segmentCoords, pos, 1) : 0;
-    this.busLocationService
-      .reportLocation({
-        busId: state.busId,
+    // Push to MQTT subscribers. `retain: true` so a frontend that connects
+    // after this tick still receives the last known position immediately on
+    // subscribe (no need to hit the HTTP endpoint for initial state). QoS 0
+    // because the next tick (~1 s) supersedes anything dropped in transit.
+    this.mqttService.publish(
+      `transit/route/${state.routeId}/position`,
+      {
         tripId: state.tripId,
+        busId: state.busId,
         routeId: state.routeId,
         longitude: pos[0],
         latitude: pos[1],
         heading,
-        speed: Math.round(BUS_SIMULATION_SPEED_KMH),
-        currentStopIndex: 0,
-      })
+        speed: reportedSpeed,
+        currentStopIndex: state.currentStopIdx,
+        recordedAt: new Date().toISOString(),
+      },
+      { qos: 0, retain: true },
+    );
+  }
+
+  /**
+   * Handle a trip reaching the last stop of its route. Under the new
+   * dispatch model the bus does NOT automatically loop back — instead the
+   * trip is marked completed, the bus is either re-queued or goes idle
+   * (decided by {@link BusDispatchService.onTripCompleted}), and the
+   * simulator drops it from in-memory state. The next dispatch tick will
+   * promote a scheduled trip to in-progress when headway elapses and
+   * `initTrip` will re-spawn the bus at stop 0 then.
+   */
+  private async completeTrip(
+    state: TripSimState,
+    _stops: BusRouteStop[],
+  ): Promise<void> {
+    const tripId = state.tripId;
+    const routeId = state.routeId;
+    const busId = state.busId;
+
+    // Evict in-memory state first so the next tick doesn't try to advance a
+    // bus whose trip is being marked completed.
+    this.trips.delete(tripId);
+
+    // Clear Redis live position so `getLivePositionsByRoute` immediately
+    // stops returning this bus (otherwise routing keeps seeing a phantom
+    // bus parked at the last stop until the 24 h TTL).
+    this.busLocationService
+      .clearLocation(tripId, routeId)
       .catch((err: unknown) =>
-        this.logger.error('reportLocation failed on loop', err),
+        this.logger.warn(`Failed to clear location for trip ${tripId}`, err),
       );
 
-    this.logger.log(`Trip ${state.tripId} completed — looping back to start`);
+    // Mark trip completed in Mongo and let the dispatch service decide
+    // whether to re-queue this bus or release it.
+    try {
+      await this.busDispatchService.onTripCompleted(tripId, busId, routeId);
+    } catch (err) {
+      this.logger.error(`Trip completion handling failed for ${tripId}`, err);
+    }
+
+    this.logger.log(
+      `Trip ${tripId} completed — bus ${busId} handed off to dispatch`,
+    );
   }
 
   // ─── Helpers ───────────────────────────────────────────────────────────────

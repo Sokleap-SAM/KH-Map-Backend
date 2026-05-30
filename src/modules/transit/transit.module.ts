@@ -17,6 +17,7 @@ import { BusTripService } from './bus-trip.service';
 import { BusLocationService } from './bus-location.service';
 import { TransitRoutingService } from './transit-routing.service';
 import { BusSimulationService } from './bus-simulation.service';
+import { BusDispatchService } from './bus-dispatch.service';
 import { OsrmService } from './osrm.service';
 import { ValhallaService } from './valhalla.service';
 
@@ -40,6 +41,7 @@ import { ValhallaService } from './valhalla.service';
     BusLocationService,
     TransitRoutingService,
     BusSimulationService,
+    BusDispatchService,
     OsrmService,
     ValhallaService,
   ],

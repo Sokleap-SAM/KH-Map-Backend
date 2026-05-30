@@ -229,6 +229,73 @@ export class ValhallaService {
     }
   }
 
+  /**
+   * Full N×M pedestrian matrix. Returns one row per source, one entry per
+   * target — unlike {@link getWalkMatrix} which collapses each row to its
+   * first target. Used by the network cache builder to compute footpath
+   * walking times between every pair of stops in a single batch.
+   *
+   * Caller is responsible for chunking very large requests; this method does
+   * not split internally.
+   */
+  async getWalkMatrixFull(
+    sources: Coords[],
+    targets: Coords[],
+  ): Promise<Array<Array<{ distanceMeters: number; durationSeconds: number } | null>>> {
+    if (sources.length === 0 || targets.length === 0) return [];
+
+    const body = {
+      sources: sources.map((c) => ({ lon: c[0], lat: c[1] })),
+      targets: targets.map((c) => ({ lon: c[0], lat: c[1] })),
+      costing: 'pedestrian',
+      costing_options: {
+        pedestrian: {
+          walking_speed: 4.5,
+          use_ferry: 0,
+          use_living_streets: 1,
+          use_tracks: 0.5,
+        },
+      },
+      units: 'kilometers',
+    };
+
+    try {
+      const res = await fetch(`${this.baseUrl}/sources_to_targets`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        // Allow longer than the single-route timeout because matrix payloads
+        // grow with sources×targets and Valhalla streams the response in one
+        // shot — a too-aggressive timeout kills otherwise-successful batches.
+        signal: AbortSignal.timeout(30_000),
+      });
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        this.logger.warn(
+          `[getWalkMatrixFull] Valhalla ${res.status}: ${text.slice(0, 120)}`,
+        );
+        return sources.map(() => targets.map(() => null));
+      }
+
+      const data = (await res.json()) as ValhallaMatrixResponse;
+      return data.sources_to_targets.map((row) =>
+        row.map((cell) => {
+          if (!cell || cell.time === null || cell.distance === null) return null;
+          return {
+            distanceMeters: cell.distance * 1000,
+            durationSeconds: cell.time,
+          };
+        }),
+      );
+    } catch (err) {
+      this.logger.warn(
+        `[getWalkMatrixFull] fetch error: ${(err as Error).message}`,
+      );
+      return sources.map(() => targets.map(() => null));
+    }
+  }
+
   // ─── Health check ──────────────────────────────────────────────────────────
 
   async isHealthy(): Promise<boolean> {
