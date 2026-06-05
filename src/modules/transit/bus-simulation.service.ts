@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/await-thenable */
 import {
   Injectable,
   Logger,
@@ -8,6 +7,7 @@ import {
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
 import { BusTrip, BusTripDocument } from './entities/bus-trip.schema';
+import { BusRoute, BusRouteDocument } from './entities/bus-route.schema';
 import { BusRouteStopService } from './bus-route-stop.service';
 import { BusLocationService } from './bus-location.service';
 import { BusDispatchService } from './bus-dispatch.service';
@@ -45,6 +45,13 @@ interface TripSimState {
   waypointIdx: number; // index into segmentCoords the bus is heading toward
   segmentCoords: Coords[]; // road waypoints for the current inter-stop segment
   /**
+   * Trip status snapshot. `scheduled` buses are "parked" at stop 0 and don't
+   * advance — `advanceBus` publishes their position with `notDepartingUntilMs`
+   * (anchor + headway) so routing can include the queue wait in their ETA.
+   * Transitions to `in-progress` when dispatch promotes the trip.
+   */
+  status: 'in-progress' | 'scheduled';
+  /**
    * Wall-clock timestamp (ms) until which the bus is dwelling at its current
    * stop and should not move. Set when the bus arrives at an intermediate
    * stop so the on-map bus matches the dwell time baked into routing costs.
@@ -75,6 +82,10 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
   /** Route stop lists — loaded once per route and reused across ticks. */
   private readonly routeStopCache = new Map<string, BusRouteStop[]>();
 
+  /** Per-route headway in minutes, refreshed lazily. Used by parked-bus
+   *  position publication to compute `notDepartingUntilMs`. */
+  private readonly routeHeadwayCache = new Map<string, number>();
+
   private intervalHandle: ReturnType<typeof setInterval> | null = null;
   private tickCount = 0;
   /** Prevents a slow tick from stacking behind a queued setInterval callback. */
@@ -91,6 +102,8 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
   constructor(
     @InjectModel(BusTrip.name)
     private readonly busTripModel: Model<BusTripDocument>,
+    @InjectModel(BusRoute.name)
+    private readonly busRouteModel: Model<BusRouteDocument>,
     private readonly busRouteStopService: BusRouteStopService,
     private readonly busLocationService: BusLocationService,
     private readonly busTripService: BusTripService,
@@ -222,6 +235,7 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
   clearInMemoryState(): void {
     this.trips.clear();
     this.routeStopCache.clear();
+    this.routeHeadwayCache.clear();
   }
 
   // ─── Tick ──────────────────────────────────────────────────────────────────
@@ -267,17 +281,21 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
       .expire(BusSimulationService.LOCK_KEY, SIM_LOCK_TTL_SECONDS)
       .catch((err: unknown) => this.logger.warn('Lock renewal failed', err));
 
+    // Pull both in-progress AND scheduled trips. Scheduled buses are tracked
+    // so their position (at stop 0, with `notDepartingUntilMs`) is published
+    // to Redis — routing then includes them in the live-ETA map with the
+    // remaining queue wait baked in, so the frontend can show their bus ID
+    // for the "view bus details" button just like any moving bus.
     const active = await this.busTripModel
-      .find({ status: 'in-progress' })
+      .find({ status: { $in: ['in-progress', 'scheduled'] } })
       .lean()
       .exec();
 
     const activeIds = new Set(active.map((t) => String(t._id)));
 
-    // Evict trips no longer in-progress, and clean their Redis live-position
-    // keys so `getLivePositionsByRoute` stops returning them — otherwise the
-    // routing service keeps treating the bus as live for up to 24 h after the
-    // trip is removed from Mongo.
+    // Evict trips no longer in-progress or scheduled (completed, cancelled,
+    // removed). Clear their Redis live-position keys so `getLivePositionsByRoute`
+    // stops returning them.
     for (const id of this.trips.keys()) {
       if (!activeIds.has(id)) {
         const evicted = this.trips.get(id);
@@ -293,6 +311,21 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
             );
         }
         this.logger.verbose(`Evicted trip ${id}`);
+      }
+    }
+
+    // Detect status transitions for already-tracked trips (most commonly:
+    // dispatch promoted a scheduled bus to in-progress).
+    for (const t of active) {
+      const id = String(t._id);
+      const existing = this.trips.get(id);
+      if (!existing) continue;
+      const newStatus = t.status as 'in-progress' | 'scheduled';
+      if (existing.status !== newStatus) {
+        existing.status = newStatus;
+        this.logger.verbose(
+          `Trip ${id} transitioned to ${newStatus} on route ${existing.routeId}`,
+        );
       }
     }
 
@@ -329,6 +362,7 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
     const tripId = String(trip._id);
     const routeId = String(trip.route);
     const stops = await this.getRouteStops(routeId);
+    const tripStatus = trip.status as 'in-progress' | 'scheduled';
 
     if (stops.length === 0) {
       this.logger.warn(
@@ -361,16 +395,20 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
         latitude: pos[1],
         ...meta,
       });
-      // Anchor the route's "last departure from first stop" to now so the
-      // routing service can project deterministic next-lap arrivals.
-      this.busLocationService
-        .setRouteDepartureAnchor(routeId, Date.now())
-        .catch((err: unknown) =>
-          this.logger.warn(
-            `Failed to set departure anchor for route ${routeId}`,
-            err,
-          ),
-        );
+      // Anchor the route's "last departure from first stop" only when the
+      // bus actually started moving (in-progress). Scheduled buses are
+      // still parked — their anchor was set by dispatch when the *previous*
+      // bus on the route departed.
+      if (tripStatus === 'in-progress') {
+        this.busLocationService
+          .setRouteDepartureAnchor(routeId, Date.now())
+          .catch((err: unknown) =>
+            this.logger.warn(
+              `Failed to set departure anchor for route ${routeId}`,
+              err,
+            ),
+          );
+      }
     } else {
       pos = [live.longitude, live.latitude];
       currentStopIdx = live.currentStopIndex;
@@ -397,10 +435,11 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
       passengerCount,
       waypointIdx,
       segmentCoords,
+      status: tripStatus,
     });
 
     this.logger.verbose(
-      `Trip ${tripId} initialised at stop ${currentStopIdx}→${nextStopIdx}${isStale ? ' (reset)' : ''}`,
+      `Trip ${tripId} initialised as ${tripStatus} at stop ${currentStopIdx}→${nextStopIdx}${isStale ? ' (reset)' : ''}`,
     );
   }
 
@@ -412,6 +451,15 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
 
     const stops = this.routeStopCache.get(state.routeId);
     if (!stops) return;
+
+    // Parked (scheduled) bus: don't move, just publish a position at stop 0
+    // with the expected departure timestamp so routing can include the
+    // queue wait in its ETA at downstream stops. The dispatch service flips
+    // this trip to 'in-progress' when its headway elapses.
+    if (state.status === 'scheduled') {
+      await this.advanceParkedBus(state, stops);
+      return;
+    }
 
     if (state.nextStopIdx >= stops.length) {
       await this.completeTrip(state, stops);
@@ -622,6 +670,99 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
     return 0;
   }
 
+  /**
+   * Per-tick advance for parked (scheduled) buses. The bus doesn't move;
+   * we just refresh its Redis position at stop 0 along with the projected
+   * departure time. Routing reads `notDepartingUntilMs` and adds the
+   * remaining wait to every downstream stop ETA so the parked bus shows
+   * up as a live boarding candidate in plan responses (with the queue
+   * delay baked in).
+   *
+   * Departure time = anchor + headway × queuePosition. With dispatch's
+   * "exactly one scheduled at a time" invariant, the parked bus is always
+   * queue position 1 — so departure = anchor + headway. If the anchor or
+   * headway is unavailable we skip publication (the bus stays invisible
+   * for that tick).
+   */
+  private async advanceParkedBus(
+    state: TripSimState,
+    stops: BusRouteStop[],
+  ): Promise<void> {
+    const headwayMin = await this.getRouteHeadway(state.routeId);
+    if (headwayMin == null) return;
+
+    const anchors = await this.busLocationService.getRouteDepartureAnchors([
+      state.routeId,
+    ]);
+    const anchorMs = anchors.get(state.routeId);
+    if (anchorMs === undefined) return;
+
+    const stop0 = stopCoords(stops[0].stop);
+    const notDepartingUntilMs = anchorMs + headwayMin * 60_000;
+    state.pos = stop0;
+    state.currentStopIdx = 0;
+
+    // Publish to Redis (live ETA query reads this) + MQTT (frontend map).
+    this.busLocationService
+      .reportLocation({
+        busId: state.busId,
+        tripId: state.tripId,
+        routeId: state.routeId,
+        longitude: stop0[0],
+        latitude: stop0[1],
+        heading: 0,
+        speed: 0,
+        currentStopIndex: 0,
+        notDepartingUntilMs,
+      })
+      .catch((err: unknown) =>
+        this.logger.warn(
+          `Parked bus reportLocation failed for trip ${state.tripId}`,
+          err,
+        ),
+      );
+
+    this.mqttService.publish(
+      `transit/route/${state.routeId}/position`,
+      {
+        tripId: state.tripId,
+        busId: state.busId,
+        routeId: state.routeId,
+        longitude: stop0[0],
+        latitude: stop0[1],
+        heading: 0,
+        speed: 0,
+        currentStopIndex: 0,
+        notDepartingUntilMs,
+        status: 'scheduled',
+        recordedAt: new Date().toISOString(),
+      },
+      { qos: 0, retain: true },
+    );
+  }
+
+  /** Return cached headwayMinutes for a route. Returns null if the route is
+   *  unknown or has no headway configured (in which case parked buses can't
+   *  be published since departure time is undefined). */
+  private async getRouteHeadway(routeId: string): Promise<number | null> {
+    const cached = this.routeHeadwayCache.get(routeId);
+    if (cached !== undefined) return cached;
+    try {
+      const route = await this.busRouteModel
+        .findById(routeId, 'headwayMinutes')
+        .lean()
+        .exec();
+      const hw = route?.headwayMinutes ?? null;
+      if (hw != null) this.routeHeadwayCache.set(routeId, hw);
+      return hw;
+    } catch (err) {
+      this.logger.warn(
+        `getRouteHeadway failed for ${routeId}: ${(err as Error).message}`,
+      );
+      return null;
+    }
+  }
+
   /** Return cached route stops, fetching from DB on first access. */
   private async getRouteStops(routeId: string): Promise<BusRouteStop[]> {
     const cached = this.routeStopCache.get(routeId);
@@ -651,38 +792,6 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
       }
     }
     return bestIdx;
-  }
-
-  /**
-   * Write live position to Redis with a hard timeout so a hanging Redis
-   * connection never keeps `this.processing = true` indefinitely.
-   * If the write fails or times out, the bus state is already updated in
-   * memory and Redis will catch up on the next successful tick.
-   */
-  private async writeWithTimeout(
-    tripId: string,
-    liveData: TripLiveData,
-  ): Promise<void> {
-    let handle: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await Promise.race([
-        this.busTripService.setLiveData(tripId, liveData),
-        new Promise<never>(
-          (_, reject) =>
-            (handle = setTimeout(
-              () => reject(new Error('Redis write timeout')),
-              2_000,
-            )),
-        ),
-      ]);
-    } catch (err) {
-      this.logger.warn(
-        `Redis write skipped for trip ${tripId} — will retry next tick`,
-        err,
-      );
-    } finally {
-      clearTimeout(handle);
-    }
   }
 
   /**

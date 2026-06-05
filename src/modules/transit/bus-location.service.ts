@@ -19,6 +19,10 @@ const routeDepartureAnchorKey = (routeId: string) =>
 export interface LiveBusPosition {
   tripId: string;
   routeId: string;
+  /** Mongo ObjectId (as string) of the Bus operating this trip. Needed so
+   *  plan responses can include `busId` on each bus segment for the
+   *  frontend's "view bus details" button. */
+  busId?: string;
   longitude: number;
   latitude: number;
   heading: number | null;
@@ -26,6 +30,14 @@ export interface LiveBusPosition {
   recordedAt: string; // ISO string
   /** Index of the last stop the bus departed from — used to prevent "already passed" boarding. */
   currentStopIndex?: number;
+  /**
+   * Wall-clock timestamp (ms) at which a *scheduled* bus is expected to leave
+   * stop 0. Set on parked-queue buses by the simulator; absent for actively
+   * moving (in-progress) buses. The routing service adds the "until departure"
+   * delta to every projected stop ETA so a scheduled bus's downstream arrivals
+   * include the queue wait.
+   */
+  notDepartingUntilMs?: number;
 }
 
 @Injectable()
@@ -52,12 +64,14 @@ export class BusLocationService {
     const payload: LiveBusPosition = {
       tripId: dto.tripId,
       routeId: dto.routeId,
+      busId: dto.busId,
       longitude: dto.longitude,
       latitude: dto.latitude,
       heading: dto.heading ?? null,
       speed: dto.speed ?? null,
       recordedAt: now.toISOString(),
       currentStopIndex: dto.currentStopIndex,
+      notDepartingUntilMs: dto.notDepartingUntilMs,
     };
     await Promise.all([
       this.redisService.set(
