@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-unsafe-call */
 /* eslint-disable @typescript-eslint/no-unsafe-argument */
 /* eslint-disable @typescript-eslint/no-unsafe-member-access */
 /* eslint-disable @typescript-eslint/no-unsafe-assignment */
@@ -15,6 +16,8 @@ import { UpdateBusTripDto } from './dto/update-bus-trip.dto';
 import { BusRouteStopService } from './bus-route-stop.service';
 import { BusLocationService } from './bus-location.service';
 import { RedisService } from '../../shared/redis/redis.service';
+import { haversineMeters } from '../../shared/helpers/helper-functions';
+import { BUS_SIMULATION_SPEED_KMH } from '../../shared/constants/constants';
 
 // Redis key conventions:
 //   trip:live:{tripId}  → Hash { currentStopIndex, nextStopIndex, passengerCount, lng, lat }
@@ -192,20 +195,6 @@ export class BusTripService {
     );
   }
 
-  async findByRoute(routeId: Types.ObjectId) {
-    const trips = await this.busTripModel
-      .find({ route: routeId })
-      .populate('bus')
-      .lean()
-      .exec();
-    return Promise.all(
-      trips.map(async (trip) => {
-        const live = await this.getLiveData(trip._id.toString());
-        return this.mergeLiveData(trip, live);
-      }),
-    );
-  }
-
   async findOne(id: Types.ObjectId) {
     const trip = await this.busTripModel
       .findById(id)
@@ -365,5 +354,99 @@ export class BusTripService {
     if (!result)
       throw new NotFoundException(`BusTrip ${id.toString()} not found`);
     await this.clearLiveData(id.toString());
+  }
+
+  /**
+   * One-shot ETA snapshot for the bus detail screen. Frontend calls this on
+   * open so the card renders immediately, then keeps the value live by
+   * recomputing locally from each MQTT position tick (same math).
+   *
+   * Returns null if the trip has no live position in Redis (e.g. simulator
+   * just started, trip evicted). For scheduled (parked) buses the response
+   * carries `notDepartingUntilMs` so the client can render
+   * "Departs in N min" instead of "Arrives in N min".
+   */
+  async getEtaToNextStop(tripId: string): Promise<{
+    tripId: string;
+    routeId: string;
+    busId?: string;
+    currentLocation: { longitude: number; latitude: number };
+    speedKmh: number;
+    currentStopIndex: number;
+    nextStop: {
+      id: string;
+      name: string;
+      longitude: number;
+      latitude: number;
+    } | null;
+    etaSeconds: number;
+    etaMinutes: number;
+    notDepartingUntilMs?: number;
+    isDwelling: boolean;
+  } | null> {
+    const pos = await this.busLocationService.getLivePosition(tripId);
+    if (!pos) return null;
+
+    const stops = await this.busRouteStopService.findByRoute(
+      new Types.ObjectId(pos.routeId),
+    );
+    if (stops.length === 0) return null;
+
+    const currentIdx = pos.currentStopIndex ?? 0;
+    // Last stop reached → no next stop; client should label as "Arrived".
+    const hasNext = currentIdx + 1 < stops.length;
+    const nextIdx = hasNext ? currentIdx + 1 : currentIdx;
+    const nextStopDoc = stops[nextIdx];
+    const nextStopCoords = (nextStopDoc.stop as any).location.coordinates as [
+      number,
+      number,
+    ];
+    const nextStopName = (nextStopDoc.stop as any).name as string;
+    const nextStopId = (nextStopDoc.stop as any)._id.toString() as string;
+
+    // Speed = 0 means the bus is dwelling or parked. Routing math falls
+    // back to BUS_SIMULATION_SPEED_KMH so we still surface a sensible
+    // "next departure ETA" even when motion is paused; client uses the
+    // `isDwelling` flag to decide whether to render a static label instead.
+    const isDwelling = (pos.speed ?? 0) <= 0;
+    const speedKmh =
+      pos.speed && pos.speed > 1 ? pos.speed : BUS_SIMULATION_SPEED_KMH;
+
+    let etaSeconds: number;
+    if (pos.notDepartingUntilMs && pos.notDepartingUntilMs > Date.now()) {
+      // Parked bus: ETA is the remaining queue wait. Riding time to the
+      // next stop is small relative to headway, so we report just the wait
+      // and the client labels it "Departs in".
+      etaSeconds = Math.round((pos.notDepartingUntilMs - Date.now()) / 1000);
+    } else if (!hasNext) {
+      etaSeconds = 0;
+    } else {
+      const remainingMeters = haversineMeters(
+        [pos.longitude, pos.latitude],
+        nextStopCoords,
+      );
+      etaSeconds = Math.round((remainingMeters / (speedKmh * 1000)) * 3600);
+    }
+
+    return {
+      tripId,
+      routeId: pos.routeId,
+      busId: pos.busId,
+      currentLocation: { longitude: pos.longitude, latitude: pos.latitude },
+      speedKmh: pos.speed ?? 0,
+      currentStopIndex: currentIdx,
+      nextStop: hasNext
+        ? {
+            id: nextStopId,
+            name: nextStopName,
+            longitude: nextStopCoords[0],
+            latitude: nextStopCoords[1],
+          }
+        : null,
+      etaSeconds,
+      etaMinutes: Math.max(0, Math.round(etaSeconds / 60)),
+      notDepartingUntilMs: pos.notDepartingUntilMs,
+      isDwelling,
+    };
   }
 }

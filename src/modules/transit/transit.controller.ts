@@ -26,8 +26,10 @@ import { TransitRoutingService } from './transit-routing.service';
 import { BusLocationService } from './bus-location.service';
 import { BusSimulationService } from './bus-simulation.service';
 import { BusDispatchService } from './bus-dispatch.service';
+import { FavoriteTransitRouteService } from './favorite-transit-route.service';
 import { PlanRouteDto } from './dto/plan-route.dto';
 import { ReportBusLocationDto } from './dto/report-bus-location.dto';
+import { CreateFavoriteTransitRouteDto } from './dto/create-favorite-transit-route.dto';
 
 @Controller('transit')
 export class TransitController {
@@ -40,6 +42,7 @@ export class TransitController {
     private readonly busLocationService: BusLocationService,
     private readonly busSimulationService: BusSimulationService,
     private readonly busDispatchService: BusDispatchService,
+    private readonly favoriteTransitRouteService: FavoriteTransitRouteService,
   ) {}
 
   // ─── Route Planning ────────────────────────────────────────
@@ -231,6 +234,18 @@ export class TransitController {
     return this.busTripService.findOne(new Types.ObjectId(id));
   }
 
+  /**
+   * One-shot ETA + next-stop info for the bus detail screen. Called when the
+   * client opens the detail card so it can render immediately; the same value
+   * is then kept live on the client by recomputing from MQTT position ticks.
+   *
+   * GET /transit/trips/:id/eta
+   */
+  @Get('trips/:id/eta')
+  getTripEta(@Param('id') id: string) {
+    return this.busTripService.getEtaToNextStop(id);
+  }
+
   @Patch('trips/:id')
   updateTrip(@Param('id') id: string, @Body() dto: UpdateBusTripDto) {
     return this.busTripService.update(new Types.ObjectId(id), dto);
@@ -288,6 +303,60 @@ export class TransitController {
   stopSimulation() {
     this.busSimulationService.stop();
     return { running: this.busSimulationService.running };
+  }
+
+  // ─── Favorite Transit Routes ──────────────────────────────────────────────
+
+  /**
+   * Save the user's chosen plan option as a favorite. The body carries the
+   * skeleton (origin, destination, ordered legs of {route, board, alight})
+   * — everything else is recomputed on open from the live network.
+   *
+   * POST /transit/favorites
+   */
+  @Post('favorites')
+  createFavorite(@Body() dto: CreateFavoriteTransitRouteDto) {
+    return this.favoriteTransitRouteService.create(dto);
+  }
+
+  /**
+   * List a user's saved favorites, newest first.
+   *
+   * GET /transit/favorites?user=<userId>
+   */
+  @Get('favorites')
+  listFavorites(@Query('user') userId: string) {
+    return this.favoriteTransitRouteService.findByUser(
+      new Types.ObjectId(userId),
+    );
+  }
+
+  /**
+   * Return the saved skeleton only (no live recomputation).
+   *
+   * GET /transit/favorites/:id
+   */
+  @Get('favorites/:id')
+  getFavorite(@Param('id') id: string) {
+    return this.favoriteTransitRouteService.findOne(new Types.ObjectId(id));
+  }
+
+  /**
+   * Open a favorite for navigation: rebuild walk legs (Valhalla) and bus ETAs
+   * (live + anchored) from the saved skeleton. Returns the same option shape
+   * as `/transit/plan` so the same UI renders it. 410 Gone if any referenced
+   * route/stop has been removed since save.
+   *
+   * GET /transit/favorites/:id/live
+   */
+  @Get('favorites/:id/live')
+  openFavorite(@Param('id') id: string) {
+    return this.favoriteTransitRouteService.openLive(new Types.ObjectId(id));
+  }
+
+  @Delete('favorites/:id')
+  removeFavorite(@Param('id') id: string) {
+    return this.favoriteTransitRouteService.remove(new Types.ObjectId(id));
   }
 
   // ─── Dispatch (dev only) ──────────────────────────────────────────────────

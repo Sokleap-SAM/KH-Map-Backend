@@ -109,7 +109,4 @@ export class BusRouteStopService {
       throw new NotFoundException(`BusRouteStop ${id.toString()} not found`);
   }
 
-  async removeByRoute(routeId: Types.ObjectId): Promise<void> {
-    await this.busRouteStopModel.deleteMany({ route: routeId }).exec();
-  }
 }

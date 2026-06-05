@@ -78,12 +78,23 @@ interface RouteStop {
   segmentPathCoords: [number, number][] | null;
 }
 
+/**
+ * One live-bus ETA at a specific stop, with the identifiers needed for the
+ * response to point the frontend at a specific bus/trip. Built in
+ * computeLiveEtaMap, sorted ascending by `eta` within each stop's list.
+ */
+interface BusEta {
+  eta: number;
+  busId?: string;
+  tripId: string;
+}
+
 interface BoardEdge {
   type: 'board';
   to: string;
   routeId: string;
   boardingStopId: string;
-  busEtas: number[];
+  busEtas: BusEta[];
   headwayMinutes: number | null;
   hasLiveEta: boolean;
   /**
@@ -188,14 +199,24 @@ function transferRadiusForRound(round: number): number {
 // `earliestBoardMinutes`, so very long walks still land on a real future
 // arrival rather than something in the past.
 function pickBoardTime(
-  busEtas: number[],
+  busEtas: BusEta[],
   headwayMinutes: number,
   earliestBoardMinutes: number,
   anchoredNextLapArrivalMinutes?: number,
-): { boardTime: number; hasLiveEta: boolean } {
-  const catchable = busEtas.find((eta) => eta >= earliestBoardMinutes);
+): {
+  boardTime: number;
+  hasLiveEta: boolean;
+  busId?: string;
+  tripId?: string;
+} {
+  const catchable = busEtas.find((e) => e.eta >= earliestBoardMinutes);
   if (catchable !== undefined) {
-    return { boardTime: catchable, hasLiveEta: true };
+    return {
+      boardTime: catchable.eta,
+      hasLiveEta: true,
+      busId: catchable.busId,
+      tripId: catchable.tripId,
+    };
   }
   if (
     anchoredNextLapArrivalMinutes !== undefined &&
@@ -205,7 +226,7 @@ function pickBoardTime(
     while (projected < earliestBoardMinutes) projected += headwayMinutes;
     return { boardTime: projected, hasLiveEta: false };
   }
-  const base = busEtas.length > 0 ? busEtas[busEtas.length - 1] : 0;
+  const base = busEtas.length > 0 ? busEtas[busEtas.length - 1].eta : 0;
   let projected = base + headwayMinutes;
   while (projected < earliestBoardMinutes) projected += headwayMinutes;
   return { boardTime: projected, hasLiveEta: false };
@@ -285,7 +306,7 @@ export class TransitRoutingService {
   } | null = null;
 
   private liveEtaCache: {
-    map: Map<string, Map<string, number[]>>;
+    map: Map<string, Map<string, BusEta[]>>;
     builtAt: number;
   } | null = null;
 
@@ -396,7 +417,7 @@ export class TransitRoutingService {
   // queries seconds apart can produce different transfer choices as buses tick.
   private async getLiveEtaMap(
     routeStopsMap: Map<string, RouteStop[]>,
-  ): Promise<Map<string, Map<string, number[]>>> {
+  ): Promise<Map<string, Map<string, BusEta[]>>> {
     const now = Date.now();
     if (
       this.liveEtaCache &&
@@ -493,9 +514,7 @@ export class TransitRoutingService {
     // logs don't flood every plan request. Fire-and-forget because logging
     // mustn't block the first request after invalidation.
     void this.validateHeadways(routeInfoMap).catch((err: unknown) =>
-      this.logger.warn(
-        `Headway validation failed: ${(err as Error).message}`,
-      ),
+      this.logger.warn(`Headway validation failed: ${(err as Error).message}`),
     );
 
     return {
@@ -630,8 +649,9 @@ export class TransitRoutingService {
 
   private async computeLiveEtaMap(
     routeStopsMap: Map<string, RouteStop[]>,
-  ): Promise<Map<string, Map<string, number[]>>> {
-    const etaMap = new Map<string, Map<string, number[]>>();
+  ): Promise<Map<string, Map<string, BusEta[]>>> {
+    const etaMap = new Map<string, Map<string, BusEta[]>>();
+    const now = Date.now();
 
     await Promise.all(
       [...routeStopsMap.entries()].map(async ([routeId, stops]) => {
@@ -645,6 +665,14 @@ export class TransitRoutingService {
 
         for (const pos of positions) {
           const busCoords: Coords = [pos.longitude, pos.latitude];
+          // Parked (scheduled) buses sit at stop 0 with a `notDepartingUntilMs`
+          // timestamp set by the simulator. Add the remaining queue wait to
+          // every projected ETA so the bus appears catchable only after its
+          // turn comes — but it does appear, with its own busId, so the
+          // frontend can render the "view bus details" button for it.
+          const offsetMinutes = pos.notDepartingUntilMs
+            ? Math.max(0, (pos.notDepartingUntilMs - now) / 60_000)
+            : 0;
           const stopEtas = this.estimateStopEtasForBus(
             busCoords,
             stops,
@@ -652,12 +680,19 @@ export class TransitRoutingService {
           );
           for (const [stopId, etaList] of stopEtas) {
             if (!routeEta.has(stopId)) routeEta.set(stopId, []);
-            routeEta.get(stopId)!.push(...etaList);
+            const target = routeEta.get(stopId)!;
+            for (const eta of etaList) {
+              target.push({
+                eta: eta + offsetMinutes,
+                busId: pos.busId,
+                tripId: pos.tripId,
+              });
+            }
           }
         }
 
         for (const etas of routeEta.values()) {
-          etas.sort((a, b) => a - b);
+          etas.sort((a, b) => a.eta - b.eta);
         }
       }),
     );
@@ -1107,7 +1142,7 @@ export class TransitRoutingService {
     routeStopsMap: Map<string, RouteStop[]>,
     stopInfoMap: Map<string, StopInfo>,
     routeInfoMap: Map<string, RouteInfo>,
-    liveEtaMap: Map<string, Map<string, number[]>>,
+    liveEtaMap: Map<string, Map<string, BusEta[]>>,
     stopRoutes: Map<string, string[]>,
     footpaths: Map<string, Footpath[]>,
     routeAnchors: Map<string, number>,
@@ -1233,8 +1268,7 @@ export class TransitRoutingService {
           if (boardedAtIndex !== -1 && i > boardedAtIndex) {
             rideMinutesFromBoard += segTime(stops[i], stops[i - 1]);
             const arrivalOnBus = boardTime + rideMinutesFromBoard;
-            const currentTauStar =
-              tauStar.get(current.stopId) ?? Infinity;
+            const currentTauStar = tauStar.get(current.stopId) ?? Infinity;
             const improvesArrival = arrivalOnBus < currentTauStar;
 
             if (improvesArrival) {
@@ -1298,8 +1332,7 @@ export class TransitRoutingService {
           }
           const arrivalAtTo =
             baseArrival + fp.walkMinutes + TRANSFER_PENALTY_MIN;
-          const currentTauStar =
-            tauStar.get(fp.toStopId) ?? Infinity;
+          const currentTauStar = tauStar.get(fp.toStopId) ?? Infinity;
           const improves = arrivalAtTo < currentTauStar;
           // Relaxation: accept footpath improvements that are slightly worse
           // than the current best arrival. Critical for transfers like
@@ -1365,7 +1398,7 @@ export class TransitRoutingService {
     round: number,
     routeInfoMap: Map<string, RouteInfo>,
     routeStopsMap: Map<string, RouteStop[]>,
-    liveEtaMap: Map<string, Map<string, number[]>>,
+    liveEtaMap: Map<string, Map<string, BusEta[]>>,
     stopInfoMap: Map<string, StopInfo>,
     routeAnchors: Map<string, number>,
     nowMs: number,
@@ -1385,8 +1418,18 @@ export class TransitRoutingService {
 
     let rideDistance = 0;
     let rideMinutes = 0;
-    const stopSequence: Array<{ name: string; coordinates: Coords }> = [
-      { name: boardStop.name, coordinates: boardStop.coordinates },
+    // Each entry includes `stopId` (the Place._id) so the client can save the
+    // chosen journey as a favorite skeleton without re-resolving stops by name.
+    const stopSequence: Array<{
+      stopId: string;
+      name: string;
+      coordinates: Coords;
+    }> = [
+      {
+        stopId: boardedAtStopId,
+        name: boardStop.name,
+        coordinates: boardStop.coordinates,
+      },
     ];
     const busPath: [number, number][] = [
       boardStop.coordinates as [number, number],
@@ -1401,6 +1444,7 @@ export class TransitRoutingService {
       const stopInfo = stopInfoMap.get(curr.stopId);
       if (stopInfo) {
         stopSequence.push({
+          stopId: curr.stopId,
           name: stopInfo.name,
           coordinates: stopInfo.coordinates,
         });
@@ -1446,8 +1490,16 @@ export class TransitRoutingService {
         code: routeInfoMap.get(routeId)?.code ?? null,
         name: routeInfoMap.get(routeId)?.name ?? null,
       },
-      boardAt: { name: boardStop.name, coordinates: boardStop.coordinates },
-      alightAt: { name: alightStop.name, coordinates: alightStop.coordinates },
+      boardAt: {
+        stopId: boardedAtStopId,
+        name: boardStop.name,
+        coordinates: boardStop.coordinates,
+      },
+      alightAt: {
+        stopId: alightStopId,
+        name: alightStop.name,
+        coordinates: alightStop.coordinates,
+      },
       intermediateStops: stopSequence.slice(1, -1),
       path: busPath,
       distanceMeters: Math.round(rideDistance),
@@ -1470,7 +1522,7 @@ export class TransitRoutingService {
     stopInfoMap: Map<string, StopInfo>,
     routeInfoMap: Map<string, RouteInfo>,
     routeStopsMap: Map<string, RouteStop[]>,
-    liveEtaMap: Map<string, Map<string, number[]>>,
+    liveEtaMap: Map<string, Map<string, BusEta[]>>,
     routeAnchors: Map<string, number>,
     nowMs: number,
     // destSeeds: real Valhalla walk times from each reachable stop → destination.
@@ -1714,7 +1766,7 @@ export class TransitRoutingService {
     stopInfoMap: Map<string, StopInfo>,
     routeInfoMap: Map<string, RouteInfo>,
     routeStopsMap: Map<string, RouteStop[]>,
-    liveEtaMap: Map<string, Map<string, number[]>>,
+    liveEtaMap: Map<string, Map<string, BusEta[]>>,
     routeAnchors: Map<string, number>,
     nowMs: number,
     valhallaWalkCache: Map<
@@ -1965,7 +2017,7 @@ export class TransitRoutingService {
             // even when no live bus is catchable.
             const anchored =
               boardEdge.anchoredNextLapArrivalMinutes ?? undefined;
-            const { boardTime, hasLiveEta } = pickBoardTime(
+            const { boardTime, hasLiveEta, busId, tripId } = pickBoardTime(
               boardEdge.busEtas,
               hw,
               earliestBoard,
@@ -1978,14 +2030,20 @@ export class TransitRoutingService {
             seg.totalLegMinutes =
               (seg.waitMinutes as number) + (seg.rideMinutes as number);
             seg.hasLiveEta = hasLiveEta;
+            // Frontend wires the "view bus details" button to these IDs.
+            // Only set on a live boarding — for estimated next-lap the
+            // bus isn't yet assigned.
+            if (busId !== undefined) seg.busId = busId;
+            if (tripId !== undefined) seg.tripId = tripId;
 
             // Only expose ETAs the user can still catch. The uncatchable buses
             // RAPTOR saw (e.g. one arriving in 3 min when the user needs 9 min
             // to walk there) are useless to the client and confusing if shown
-            // as "Bus in ~3 min".
-            seg.busEtas = boardEdge.busEtas.filter(
-              (eta) => eta >= earliestBoard,
-            );
+            // as "Bus in ~3 min". Sent as plain numbers — the bus/trip
+            // identifiers belong on the segment, not buried per-ETA.
+            seg.busEtas = boardEdge.busEtas
+              .filter((e) => e.eta >= earliestBoard)
+              .map((e) => e.eta);
             // boardTime is in minutes from `now`; this is the single number the
             // client should display as "Bus arrives in N min". Falls back to a
             // headway-projected next-lap arrival when no live bus is catchable.
@@ -2060,6 +2118,297 @@ export class TransitRoutingService {
   ) {
     if (type === 'walk') return this.planWalkRoute(origin, destination);
     return this.planTransitRoute(origin, destination);
+  }
+
+  // ─── Favorite (skeleton-based) replan ───────────────────────────────────────
+  // The user saved a journey as { origin, destination, legs:[{route, board, alight}] }.
+  // On open we rebuild a fully-formed transit option from that skeleton: walk legs
+  // are recomputed via Valhalla, ride times come from the live network, and bus
+  // ETAs / wait times are derived from the current liveEtaMap + anchors.
+  // Returns null when any referenced route/stop no longer exists on the route, so
+  // the caller can surface a 410 Gone to prompt the user to re-save.
+  async replanFromSkeleton(skeleton: {
+    origin: Coords;
+    destination: Coords;
+    legs: Array<{
+      routeId: string;
+      boardStopId: string;
+      alightStopId: string;
+    }>;
+  }): Promise<{
+    totalEstimatedMinutes: number;
+    totalDistanceMeters: number;
+    totalWalkMeters: number;
+    transferCount: number;
+    warning?: string;
+    segments: any[];
+  } | null> {
+    this.assertCoords(skeleton.origin, 'replanFromSkeleton: origin');
+    this.assertCoords(skeleton.destination, 'replanFromSkeleton: destination');
+    if (skeleton.legs.length === 0) return null;
+
+    const network = await this.getNetwork();
+    if (network.validStopsCount === 0 || network.routeStopsMap.size === 0) {
+      return null;
+    }
+
+    // Validate every leg against the current network. Any miss → stale favorite.
+    type ResolvedLeg = {
+      routeId: string;
+      boardStopId: string;
+      alightStopId: string;
+      boardIdx: number;
+      alightIdx: number;
+    };
+    const resolved: ResolvedLeg[] = [];
+    for (const leg of skeleton.legs) {
+      const stops = network.routeStopsMap.get(leg.routeId);
+      if (!stops || stops.length < 2) return null;
+      const boardIdx = stops.findIndex((s) => s.stopId === leg.boardStopId);
+      if (boardIdx < 0) return null;
+      const alightIdx = stops.findIndex(
+        (s, i) => i > boardIdx && s.stopId === leg.alightStopId,
+      );
+      if (alightIdx <= boardIdx) return null;
+      resolved.push({
+        ...leg,
+        boardIdx,
+        alightIdx,
+      });
+    }
+
+    const liveEtaMap = await this.getLiveEtaMap(network.routeStopsMap);
+    const nowMs = Date.now();
+    const routeAnchors = await this.busLocationService.getRouteDepartureAnchors(
+      [...network.routeStopsMap.keys()],
+    );
+
+    const walkCache = new Map<
+      string,
+      { path: Coords[]; distanceMeters: number; durationSeconds: number } | null
+    >();
+    const pairKey = (from: Coords, to: Coords) =>
+      `${from[0].toFixed(5)},${from[1].toFixed(5)}→${to[0].toFixed(5)},${to[1].toFixed(5)}`;
+    const getWalk = async (from: Coords, to: Coords) => {
+      const key = pairKey(from, to);
+      if (walkCache.has(key)) return walkCache.get(key)!;
+      this.assertCoords(from, 'replanFromSkeleton: walk from');
+      this.assertCoords(to, 'replanFromSkeleton: walk to');
+      const result = await this.valhallaService.getWalkPath(from, to);
+      walkCache.set(key, result);
+      return result;
+    };
+
+    const buildWalkSegment = async (
+      from: { name: string; coordinates: Coords },
+      to: { name: string; coordinates: Coords },
+      isTransfer: boolean,
+    ) => {
+      const walk = await getWalk(from.coordinates, to.coordinates);
+      const distMeters =
+        walk?.distanceMeters ??
+        haversineMeters(from.coordinates, to.coordinates);
+      const estMinutes = walk
+        ? Math.round(walk.durationSeconds / 60) || 1
+        : Math.round(walkMinutes(distMeters, WALK_SPEED_KMH)) || 1;
+      return {
+        seg: {
+          type: 'walk' as const,
+          from,
+          to,
+          path: walk?.path ?? [from.coordinates, to.coordinates],
+          distanceMeters: Math.round(distMeters),
+          estimatedMinutes: estMinutes,
+          isTransfer,
+        },
+        minutes: estMinutes,
+      };
+    };
+
+    const segments: any[] = [];
+    let cumMinutes = 0;
+    let totalDistanceMeters = 0;
+    let totalWalkMeters = 0;
+
+    // 1) Origin walk → first board stop.
+    {
+      const firstBoardId = resolved[0].boardStopId;
+      const firstBoard = network.stopInfoMap.get(firstBoardId);
+      if (!firstBoard) return null;
+      const { seg, minutes } = await buildWalkSegment(
+        { name: 'Your Location', coordinates: skeleton.origin },
+        { name: firstBoard.name, coordinates: firstBoard.coordinates },
+        false,
+      );
+      segments.push(seg);
+      cumMinutes += minutes;
+      totalDistanceMeters += seg.distanceMeters;
+      totalWalkMeters += seg.distanceMeters;
+    }
+
+    // 2) Per-leg: bus segment, then transfer walk to the next board stop.
+    for (let i = 0; i < resolved.length; i++) {
+      const leg = resolved[i];
+      const stops = network.routeStopsMap.get(leg.routeId)!;
+      const boardStop = network.stopInfoMap.get(leg.boardStopId);
+      const alightStop = network.stopInfoMap.get(leg.alightStopId);
+      if (!boardStop || !alightStop) return null;
+
+      const routeInfo = network.routeInfoMap.get(leg.routeId);
+      const headway = routeInfo?.headwayMinutes ?? 30;
+      const busEtas = liveEtaMap.get(leg.routeId)?.get(leg.boardStopId) ?? [];
+
+      // First leg is the user's own start — only MIN_WAIT_MIN buffer; subsequent
+      // legs are transfers and need the uncertainty buffer.
+      const uncertaintyBuffer = i > 0 ? TRANSFER_UNCERTAINTY_BUFFER_MIN : 0;
+      const earliestBoardMinutes =
+        cumMinutes + MIN_WAIT_MIN + uncertaintyBuffer;
+
+      const anchoredArrival = anchoredArrivalMinutes(
+        routeAnchors.get(leg.routeId),
+        nowMs,
+        headway,
+        routeInfo?.ridePrefixMinutes,
+        routeInfo?.originalStopCount,
+        leg.boardIdx,
+      );
+      const { boardTime, hasLiveEta } = pickBoardTime(
+        busEtas,
+        headway,
+        earliestBoardMinutes,
+        anchoredArrival,
+      );
+
+      // Build ride: sum distance + minutes between consecutive stops, collect
+      // intermediate stops, and concatenate per-segment polylines into busPath.
+      let rideDistance = 0;
+      let rideMinutes = 0;
+      const stopSequence: Array<{
+        stopId: string;
+        name: string;
+        coordinates: Coords;
+      }> = [
+        {
+          stopId: leg.boardStopId,
+          name: boardStop.name,
+          coordinates: boardStop.coordinates,
+        },
+      ];
+      const busPath: [number, number][] = [
+        boardStop.coordinates as [number, number],
+      ];
+      for (let k = leg.boardIdx + 1; k <= leg.alightIdx; k++) {
+        const prev = stops[k - 1];
+        const curr = stops[k];
+        rideDistance += bestDistMeters(curr, prev);
+        rideMinutes += segTime(curr, prev);
+        const info = network.stopInfoMap.get(curr.stopId);
+        if (info) {
+          stopSequence.push({
+            stopId: curr.stopId,
+            name: info.name,
+            coordinates: info.coordinates,
+          });
+        }
+        if (curr.segmentPathCoords && curr.segmentPathCoords.length > 1) {
+          busPath.push(...curr.segmentPathCoords.slice(1));
+        } else if (info) {
+          busPath.push(info.coordinates as [number, number]);
+        }
+      }
+
+      const waitMinutes = Math.max(0, boardTime - cumMinutes);
+      const roundedWait = Math.round(waitMinutes);
+      const roundedRide = Math.max(1, Math.round(rideMinutes));
+
+      const boardEdge: BoardEdge = {
+        type: 'board',
+        to: onbusNodeId(leg.routeId, leg.boardStopId),
+        routeId: leg.routeId,
+        boardingStopId: leg.boardStopId,
+        busEtas,
+        headwayMinutes: headway,
+        hasLiveEta,
+        anchoredNextLapArrivalMinutes: anchoredArrival ?? null,
+      };
+
+      const busSeg = {
+        type: 'bus' as const,
+        route: {
+          id: leg.routeId,
+          code: routeInfo?.code ?? null,
+          name: routeInfo?.name ?? null,
+        },
+        boardAt: {
+          stopId: leg.boardStopId,
+          name: boardStop.name,
+          coordinates: boardStop.coordinates,
+        },
+        alightAt: {
+          stopId: leg.alightStopId,
+          name: alightStop.name,
+          coordinates: alightStop.coordinates,
+        },
+        intermediateStops: stopSequence.slice(1, -1),
+        path: busPath,
+        distanceMeters: Math.round(rideDistance),
+        waitMinutes: roundedWait,
+        rideMinutes: roundedRide,
+        totalLegMinutes: roundedWait + roundedRide,
+        estimatedMinutes: roundedRide,
+        hasLiveEta,
+        _boardEdge: boardEdge,
+      };
+
+      segments.push(busSeg);
+      totalDistanceMeters += busSeg.distanceMeters;
+      cumMinutes = boardTime + rideMinutes;
+
+      // Transfer walk to the next leg's board stop.
+      if (i < resolved.length - 1) {
+        const nextBoard = network.stopInfoMap.get(resolved[i + 1].boardStopId);
+        if (!nextBoard) return null;
+        const { seg, minutes } = await buildWalkSegment(
+          { name: alightStop.name, coordinates: alightStop.coordinates },
+          { name: nextBoard.name, coordinates: nextBoard.coordinates },
+          true,
+        );
+        segments.push(seg);
+        cumMinutes += minutes;
+        totalDistanceMeters += seg.distanceMeters;
+        totalWalkMeters += seg.distanceMeters;
+      }
+    }
+
+    // 3) Last-mile walk: last alight stop → destination.
+    {
+      const last = resolved[resolved.length - 1];
+      const lastAlight = network.stopInfoMap.get(last.alightStopId);
+      if (!lastAlight) return null;
+      const { seg, minutes } = await buildWalkSegment(
+        { name: lastAlight.name, coordinates: lastAlight.coordinates },
+        { name: 'Destination', coordinates: skeleton.destination },
+        false,
+      );
+      segments.push(seg);
+      cumMinutes += minutes;
+      totalDistanceMeters += seg.distanceMeters;
+      totalWalkMeters += seg.distanceMeters;
+    }
+
+    const warning =
+      totalWalkMeters > LONG_WALK_WARNING_M
+        ? `Long walking distance: ${Math.round(totalWalkMeters)}m total`
+        : undefined;
+
+    return {
+      totalEstimatedMinutes: Math.round(cumMinutes),
+      totalDistanceMeters: Math.round(totalDistanceMeters),
+      totalWalkMeters: Math.round(totalWalkMeters),
+      transferCount: Math.max(0, resolved.length - 1),
+      warning,
+      segments,
+    };
   }
 
   private async planWalkRoute(origin: Coords, destination: Coords) {
@@ -2273,7 +2622,10 @@ export class TransitRoutingService {
       const allHaveHighWait = finalOptions.every((o) => {
         const wait = (o.segments as any[])
           .filter((s) => s.type === 'bus')
-          .reduce((sum: number, s: any) => sum + ((s.waitMinutes as number) ?? 0), 0);
+          .reduce(
+            (sum: number, s: any) => sum + ((s.waitMinutes as number) ?? 0),
+            0,
+          );
         const total = o.totalEstimatedMinutes;
         return total > 0 && wait / total > 0.5;
       });
