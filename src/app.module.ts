@@ -15,6 +15,7 @@ import { PlaceModule } from './modules/places/place.module';
 import { TransitModule } from './modules/transit/transit.module';
 import { UsersModule } from './modules/users/user.module';
 import { SearchHistoryModule } from './modules/search-history/search-history.module';
+import { FavoritesModule } from './modules/favorites/favorites.module';
 
 @Module({
   imports: [
@@ -30,6 +31,7 @@ import { SearchHistoryModule } from './modules/search-history/search-history.mod
     TransitModule,
     UsersModule,
     SearchHistoryModule,
+    FavoritesModule,
   ],
 })
 export class AppModule {}
