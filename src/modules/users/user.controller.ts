@@ -4,9 +4,12 @@ import {
   Body,
   UseGuards,
   Get,
+  Param,
+  Patch,
   Request as Req,
 } from '@nestjs/common';
 import { Request } from 'express';
+import { Types } from 'mongoose';
 import { UsersService } from './user.service';
 import { LoginDto } from './dto/login.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
@@ -14,6 +17,8 @@ import { CreateUserDto } from './dto/create-user.dto';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { UserRole } from './enums/role.enum';
 import { Roles } from '../../common/decorators/roles.decorator';
+import { SetRoleDto } from './dto/set-role.dto';
+import { AssignBusDto } from './dto/assign-bus.dto';
 
 interface AuthenticatedRequest extends Request {
   user: {
@@ -62,5 +67,30 @@ export class UsersController {
     @Body('newPassword') newPassword: string,
   ) {
     return this.usersService.resetPassword(email, otp, newPassword);
+  }
+
+  // ─── Admin: role + driver assignment ──────────────────────────────────────
+
+  /** Promote/demote a user. Demoting a driver auto-unassigns their bus. */
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
+  @Patch('admin/users/:id/role')
+  setUserRole(@Param('id') id: string, @Body() dto: SetRoleDto) {
+    return this.usersService.setRole(new Types.ObjectId(id), dto.role);
+  }
+
+  /**
+   * Bind/unbind a driver to a bus. Pass `{ busId: null }` (or omit) to
+   * unassign. Throws ConflictException if the bus is already bound to a
+   * different driver — unassign that one first.
+   */
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
+  @Patch('admin/drivers/:id/assign-bus')
+  assignBus(@Param('id') id: string, @Body() dto: AssignBusDto) {
+    return this.usersService.assignBusToDriver(
+      new Types.ObjectId(id),
+      dto.busId ? new Types.ObjectId(dto.busId) : null,
+    );
   }
 }

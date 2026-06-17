@@ -15,14 +15,19 @@ import { BusTripService, TripLiveData } from './bus-trip.service';
 import { BusRouteStop } from './entities/bus-route-stop.schema';
 import { RedisService } from '../../shared/redis/redis.service';
 import { MqttService } from '../../shared/mqtt/mqtt.service';
+import { AppSettingsService } from '../app-settings/app-settings.service';
+import { TransitMode } from '../app-settings/enums/transit-mode.enum';
 import {
   TICK_MS,
   BUS_SIMULATION_SPEED_KMH,
+  BUS_ROUTING_SPEED_KMH,
   SIMULATION_SPEED_M_PER_TICK,
   SYNC_EVERY_N_TICKS,
   SIM_LOCK_TTL_SECONDS,
   STOP_ARRIVAL_RADIUS_M,
   DWELL_TIME_MIN,
+  DETAIL_PUBLISH_EVERY_N_TICKS,
+  TRIP_DETAIL_FORWARD_STOPS,
 } from '../../shared/constants/constants';
 import {
   Coords,
@@ -110,6 +115,7 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
     private readonly busDispatchService: BusDispatchService,
     private readonly redisService: RedisService,
     private readonly mqttService: MqttService,
+    private readonly appSettings: AppSettingsService,
   ) {}
 
   /** Tracks whether the caller wants the simulator running, even if start
@@ -142,6 +148,14 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
   private async attemptStart(): Promise<void> {
     if (!this.wantedRunning) return; // cancelled by stop() while retrying
     if (this._running) return;
+
+    // Real-world mode: drivers run the buses, the simulator must not move
+    // them. Refuse to start so a stale `await start()` from boot doesn't
+    // resurrect the sim loop after admin flipped to live.
+    if (this.appSettings.getMode() === TransitMode.LIVE) {
+      this.logger.log('Transit mode = live, simulation start skipped');
+      return;
+    }
 
     // Acquire a distributed lock so only one instance runs the simulation.
     // On single-instance deploys this is a no-op; on multi-instance it prevents
@@ -242,6 +256,10 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
 
   private async runTick(): Promise<void> {
     if (this.processing) return; // drop tick if previous still in-flight
+    // Defence-in-depth: stop() is called explicitly when admin flips to live,
+    // but if a tick somehow fires after the flip (race with setInterval),
+    // bail so the simulator never moves a real-world bus.
+    if (this.appSettings.getMode() === TransitMode.LIVE) return;
     this.processing = true;
     this.tickCount++;
 
@@ -605,6 +623,114 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
       },
       { qos: 0, retain: true },
     );
+
+    // Throttled visibility log so a multi-bus sim doesn't spam stdout. Logs
+    // once per DETAIL_PUBLISH_EVERY_N_TICKS per bus — same cadence as the
+    // detail topic, ~1 line per bus per 3 s.
+    if (this.tickCount % DETAIL_PUBLISH_EVERY_N_TICKS === 0) {
+      this.logger.log(
+        `[sim] bus=${state.busId} trip=${state.tripId} route=${state.routeId} @ ${pos[0].toFixed(5)},${pos[1].toFixed(5)} spd=${reportedSpeed}`,
+      );
+    }
+
+    // Per-trip detail topic, throttled to DETAIL_PUBLISH_EVERY_N_TICKS. The
+    // map-view subscribers only need position (above); the bus-detail card
+    // wants richer data (ETAs to upcoming stops, passenger count). Different
+    // cadence and payload size — separate topic keeps each audience lean.
+    if (this.tickCount % DETAIL_PUBLISH_EVERY_N_TICKS === 0) {
+      this.mqttService.publish(
+        `transit/trip/${state.tripId}/detail`,
+        this.buildTripDetail(state, stops, pos, heading, reportedSpeed),
+        { qos: 0, retain: true },
+      );
+    }
+  }
+
+  /**
+   * Build the per-trip detail payload published on `transit/trip/<tripId>/detail`.
+   * Includes the bus's current position plus ETAs for the next few upcoming
+   * stops. Returns null for the next-stop ETA when the trip has finished its
+   * route (caller should suppress that case before invoking).
+   *
+   * ETA strategy:
+   *   - Next stop: `haversine(currentPos, nextStop) / BUS_SIMULATION_SPEED_KMH`
+   *     — matches what the user sees on the map.
+   *   - Subsequent stops: routing speed + per-stop dwell. Keeps the detail
+   *     ETAs consistent with what the planner displays in route plans, so a
+   *     user comparing the two doesn't see contradictory minutes.
+   */
+  private buildTripDetail(
+    state: TripSimState,
+    stops: BusRouteStop[],
+    pos: Coords,
+    heading: number,
+    reportedSpeed: number,
+  ): Record<string, unknown> {
+    const upcoming: Array<{
+      stopId: string;
+      name: string;
+      etaMinutes: number;
+    }> = [];
+    let etaNextStopMin: number | null = null;
+
+    if (state.nextStopIdx < stops.length) {
+      const nextStop = stops[state.nextStopIdx];
+      const nextCoords = stopCoords(nextStop.stop);
+      const distToNextM = haversineMeters(pos, nextCoords);
+      const nextEtaMin = (distToNextM / 1000 / BUS_SIMULATION_SPEED_KMH) * 60;
+      etaNextStopMin = Math.max(0, Math.round(nextEtaMin * 10) / 10);
+
+      const nextStopRef = nextStop.stop as unknown as {
+        _id?: { toString(): string };
+        name?: string;
+      };
+      let cumMin = nextEtaMin;
+      upcoming.push({
+        stopId: nextStopRef._id?.toString() ?? '',
+        name: nextStopRef.name ?? '',
+        etaMinutes: etaNextStopMin,
+      });
+
+      for (
+        let i = state.nextStopIdx + 1;
+        i < stops.length && upcoming.length < TRIP_DETAIL_FORWARD_STOPS;
+        i++
+      ) {
+        const prev = stops[i - 1];
+        const curr = stops[i];
+        const segDist = haversineMeters(
+          stopCoords(prev.stop),
+          stopCoords(curr.stop),
+        );
+        cumMin +=
+          (segDist / 1000 / BUS_ROUTING_SPEED_KMH) * 60 + DWELL_TIME_MIN;
+        const currRef = curr.stop as unknown as {
+          _id?: { toString(): string };
+          name?: string;
+        };
+        upcoming.push({
+          stopId: currRef._id?.toString() ?? '',
+          name: currRef.name ?? '',
+          etaMinutes: Math.max(0, Math.round(cumMin * 10) / 10),
+        });
+      }
+    }
+
+    return {
+      tripId: state.tripId,
+      busId: state.busId,
+      routeId: state.routeId,
+      longitude: pos[0],
+      latitude: pos[1],
+      heading,
+      speed: reportedSpeed,
+      currentStopIndex: state.currentStopIdx,
+      nextStopIndex: state.nextStopIdx,
+      etaNextStopMin,
+      upcomingStops: upcoming,
+      passengerCount: state.passengerCount,
+      recordedAt: new Date().toISOString(),
+    };
   }
 
   /**

@@ -15,6 +15,8 @@ import { PlaceModule } from './modules/places/place.module';
 import { TransitModule } from './modules/transit/transit.module';
 import { UsersModule } from './modules/users/user.module';
 import { SearchHistoryModule } from './modules/search-history/search-history.module';
+import { AppSettingsModule } from './modules/app-settings/app-settings.module';
+import { MqttAuthModule } from './modules/mqtt-auth/mqtt-auth.module';
 
 @Module({
   imports: [
@@ -26,9 +28,11 @@ import { SearchHistoryModule } from './modules/search-history/search-history.mod
     DatabaseModule,
     RedisModule,
     MqttModule,
+    AppSettingsModule,
     PlaceModule,
     TransitModule,
     UsersModule,
+    MqttAuthModule,
     SearchHistoryModule,
   ],
 })

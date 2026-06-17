@@ -10,6 +10,8 @@ import {
 } from './entities/bus-location.schema';
 import { BusLocationService } from './bus-location.service';
 import { RedisService } from '../../shared/redis/redis.service';
+import { AppSettingsService } from '../app-settings/app-settings.service';
+import { TransitMode } from '../app-settings/enums/transit-mode.enum';
 
 /**
  * Automated bus dispatching that maintains a per-route "queue":
@@ -44,6 +46,7 @@ export class BusDispatchService {
     private readonly busLocationModel: Model<BusLocationDocument>,
     private readonly busLocationService: BusLocationService,
     private readonly redisService: RedisService,
+    private readonly appSettings: AppSettingsService,
   ) {}
 
   /**
@@ -89,11 +92,40 @@ export class BusDispatchService {
   }
 
   /**
+   * Cancel every scheduled and in-progress trip and clear their live-state
+   * Redis keys. Used when admin flips to live mode — buses stay (drivers will
+   * operate them) but the sim-generated queue must be wiped so the real-world
+   * fleet starts from a clean slate.
+   */
+  async cancelAllActiveTrips(): Promise<{ cancelled: number }> {
+    const result = await this.busTripModel
+      .updateMany(
+        { status: { $in: ['in-progress', 'scheduled'] } },
+        { status: 'cancelled', completedAt: new Date() },
+      )
+      .exec();
+
+    await this.redisService.deleteByPattern('bus:trip:*:location');
+    await this.redisService.deleteByPattern('trip:live:*');
+    await this.redisService.deleteByPattern('route:lastDeparture:*');
+    await this.redisService.del('bus:locations');
+
+    this.logger.warn(
+      `Mode flip to live: cancelled ${result.modifiedCount} active trips and cleared sim Redis state`,
+    );
+    return { cancelled: result.modifiedCount ?? 0 };
+  }
+
+  /**
    * Visit every active route and apply the queue invariant. Idempotent and
    * fire-and-forget safe — running more often than necessary just means
    * extra DB queries.
    */
   async run(): Promise<void> {
+    // Real-world mode: trips are created by admin and started by drivers —
+    // dispatch must not auto-spawn or auto-promote anything.
+    if (this.appSettings.getMode() === TransitMode.LIVE) return;
+
     const routes = await this.busRouteModel
       .find({ status: 'active' })
       .lean()

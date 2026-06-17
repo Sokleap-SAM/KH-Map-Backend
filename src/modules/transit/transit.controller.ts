@@ -8,8 +8,16 @@ import {
   Patch,
   Post,
   Query,
+  UseGuards,
 } from '@nestjs/common';
 import { Types } from 'mongoose';
+import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
+import { RolesGuard } from '../../common/guards/roles.guard';
+import { Roles } from '../../common/decorators/roles.decorator';
+import { UserRole } from '../users/enums/role.enum';
+import { AppSettingsService } from '../app-settings/app-settings.service';
+import { TransitMode } from '../app-settings/enums/transit-mode.enum';
+import { SetTransitModeDto } from './dto/set-transit-mode.dto';
 import { BusRouteService } from './bus-route.service';
 import { BusRouteStopService } from './bus-route-stop.service';
 import { BusService } from './bus.service';
@@ -18,6 +26,9 @@ import { CreateBusRouteDto } from './dto/create-bus-route.dto';
 import { UpdateBusRouteDto } from './dto/update-bus-route.dto';
 import { CreateBusRouteStopDto } from './dto/create-bus-route-stop.dto';
 import { UpdateBusRouteStopDto } from './dto/update-bus-route-stop.dto';
+import { BulkBusRouteStopsDto } from './dto/bulk-bus-route-stops.dto';
+import { SuggestPathDto } from './dto/suggest-path.dto';
+import { ValhallaService } from './valhalla.service';
 import { CreateBusDto } from './dto/create-bus.dto';
 import { UpdateBusDto } from './dto/update-bus.dto';
 import { CreateBusTripDto } from './dto/create-bus-trip.dto';
@@ -43,7 +54,51 @@ export class TransitController {
     private readonly busSimulationService: BusSimulationService,
     private readonly busDispatchService: BusDispatchService,
     private readonly favoriteTransitRouteService: FavoriteTransitRouteService,
+    private readonly appSettings: AppSettingsService,
+    private readonly valhallaService: ValhallaService,
   ) {}
+
+  // ─── Admin: global transit mode ───────────────────────────────────────────
+
+  /** GET /transit/admin/settings/mode → { mode } */
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
+  @Get('admin/settings/mode')
+  getMode() {
+    return { mode: this.appSettings.getMode() };
+  }
+
+  /**
+   * Flip the global transit mode. Orchestrates the side-effects so the
+   * system is consistent the moment the response returns:
+   *   - to `live`: cancel every scheduled/in-progress sim trip, stop the
+   *     simulator loop. Drivers can now start their own assigned trips.
+   *   - to `simulation`: restart the simulator loop. Dispatch will bootstrap
+   *     fresh trips on its next sync tick.
+   *
+   * PATCH /transit/admin/settings/mode  { mode: 'live' | 'simulation' }
+   */
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
+  @Patch('admin/settings/mode')
+  async setMode(@Body() dto: SetTransitModeDto) {
+    const previous = this.appSettings.getMode();
+    if (previous === dto.mode) {
+      return { mode: dto.mode, changed: false };
+    }
+
+    await this.appSettings.setMode(dto.mode);
+
+    if (dto.mode === TransitMode.LIVE) {
+      this.busSimulationService.stop();
+      const cancelled = await this.busDispatchService.cancelAllActiveTrips();
+      return { mode: dto.mode, changed: true, ...cancelled };
+    }
+
+    // simulation
+    await this.busSimulationService.start();
+    return { mode: dto.mode, changed: true };
+  }
 
   // ─── Route Planning ────────────────────────────────────────
 
@@ -125,6 +180,47 @@ export class TransitController {
   }
 
   // ─── Route Stops ───────────────────────────────────────────
+
+  /**
+   * Bulk-create stops on a route from a sequence of map clicks. If `routeId`
+   * is omitted a fresh BusRoute is created from the metadata fields; if it's
+   * provided the stops are appended after the existing tail. Every non-first
+   * stop must include a manually-drawn `segmentFromPrevious` polyline; the
+   * backend stores it verbatim (no snapping). Use `/admin/suggest-path` to
+   * pre-fill a draft polyline if the admin wants Valhalla's suggestion.
+   */
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
+  @Post('admin/route-stops/bulk')
+  async bulkCreateRouteStops(@Body() dto: BulkBusRouteStopsDto) {
+    const result = await this.busRouteStopService.bulkUpsert(dto);
+    await this.transitRoutingService.invalidateNetworkCache();
+    return result;
+  }
+
+  /**
+   * Pre-fill helper for the admin's manual-draw tool. Returns Valhalla's
+   * road-snapped polyline between two coords using `costing=auto`. The
+   * frontend uses this to seed the drawing — the admin can accept, edit, or
+   * discard — but the bulk endpoint never calls Valhalla itself.
+   */
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
+  @Get('admin/suggest-path')
+  async suggestPath(@Query() query: SuggestPathDto) {
+    const result = await this.valhallaService.getAutoPath(
+      [query.fromLng, query.fromLat],
+      [query.toLng, query.toLat],
+    );
+    if (!result) {
+      throw new ForbiddenException('Valhalla could not route between points');
+    }
+    return {
+      coordinates: result.path,
+      distanceMeters: result.distanceMeters,
+      durationSeconds: result.durationSeconds,
+    };
+  }
 
   @Post('route-stops')
   async createRouteStop(@Body() dto: CreateBusRouteStopDto) {
@@ -332,26 +428,15 @@ export class TransitController {
   }
 
   /**
-   * Return the saved skeleton only (no live recomputation).
+   * Return the saved favorite (user, label, origin, destination). The client
+   * then calls `GET /transit/plan` with the returned origin/destination to get
+   * fresh options.
    *
    * GET /transit/favorites/:id
    */
   @Get('favorites/:id')
   getFavorite(@Param('id') id: string) {
     return this.favoriteTransitRouteService.findOne(new Types.ObjectId(id));
-  }
-
-  /**
-   * Open a favorite for navigation: rebuild walk legs (Valhalla) and bus ETAs
-   * (live + anchored) from the saved skeleton. Returns the same option shape
-   * as `/transit/plan` so the same UI renders it. 410 Gone if any referenced
-   * route/stop has been removed since save.
-   *
-   * GET /transit/favorites/:id/live
-   */
-  @Get('favorites/:id/live')
-  openFavorite(@Param('id') id: string) {
-    return this.favoriteTransitRouteService.openLive(new Types.ObjectId(id));
   }
 
   @Delete('favorites/:id')

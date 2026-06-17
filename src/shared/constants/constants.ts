@@ -59,6 +59,22 @@ export const SIMULATION_SPEED_M_PER_TICK =
 export const SYNC_EVERY_N_TICKS = 5;
 
 /**
+ * Publish the per-trip detail topic (ETAs, passenger count, etc.) every N ticks
+ * instead of every tick. Position updates are kept at 1 Hz for smooth map
+ * animation; ETA payloads don't change meaningfully in 1 s, so the bus-detail
+ * card subscribers are fine with a 3 s update cadence — saves bandwidth and
+ * publish overhead without hurting UX.
+ */
+export const DETAIL_PUBLISH_EVERY_N_TICKS = 3;
+
+/**
+ * Max number of upcoming stops to include in each trip-detail publish. Bounds
+ * payload size on long routes — a frontend usually only needs the next few
+ * stops in its detail card.
+ */
+export const TRIP_DETAIL_FORWARD_STOPS = 5;
+
+/**
  * Haversine distance (meters) within which the simulated bus is considered
  * to have arrived at its next stop. The simulator advances along the
  * segmentPath waypoints, but the last waypoint isn't always exactly at the

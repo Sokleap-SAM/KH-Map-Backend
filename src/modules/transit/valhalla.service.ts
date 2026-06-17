@@ -150,6 +150,56 @@ export class ValhallaService {
     }
   }
 
+  // ─── Single auto (vehicle) route ───────────────────────────────────────────
+
+  /**
+   * Returns the road-snapped driving path between two coordinates using the
+   * `auto` costing model. Used by admin bulk-create flows to compute the
+   * polyline arriving at each bus stop from the previous one.
+   * Coords format: [longitude, latitude] (GeoJSON order).
+   */
+  async getAutoPath(from: Coords, to: Coords): Promise<WalkRouteResult | null> {
+    const body = {
+      locations: [
+        { lon: from[0], lat: from[1], type: 'break' },
+        { lon: to[0], lat: to[1], type: 'break' },
+      ],
+      costing: 'auto',
+      units: 'kilometers',
+      language: 'en-US',
+    };
+
+    try {
+      const res = await fetch(`${this.baseUrl}/route`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(5_000),
+      });
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        this.logger.warn(
+          `[getAutoPath] Valhalla ${res.status}: ${text.slice(0, 120)}`,
+        );
+        return null;
+      }
+
+      const data = (await res.json()) as ValhallaRouteResponse;
+      const leg = data.trip?.legs?.[0];
+      if (!leg) return null;
+
+      return {
+        path: decodePolyline6(leg.shape),
+        distanceMeters: leg.summary.length * 1000,
+        durationSeconds: leg.summary.time,
+      };
+    } catch (err) {
+      this.logger.warn(`[getAutoPath] fetch error: ${(err as Error).message}`);
+      return null;
+    }
+  }
+
   // ─── Matrix API: full N×M pedestrian matrix ────────────────────────────────
 
   /**

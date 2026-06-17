@@ -12,6 +12,12 @@ export class BusTrip extends BaseEntity {
   @Prop({ required: true, type: Types.ObjectId, ref: 'Bus' })
   bus!: Types.ObjectId;
 
+  // Driver who actually operated this trip. Stamped on startTrip; stays set
+  // even after the trip is completed or cancelled so the driver's trip
+  // history survives bus reassignment.
+  @Prop({ type: Types.ObjectId, ref: 'User', default: null })
+  driver!: Types.ObjectId | null;
+
   @Prop({
     required: true,
     type: String,
@@ -31,3 +37,4 @@ export const BusTripSchema = SchemaFactory.createForClass(BusTrip);
 BusTripSchema.index({ status: 1 });
 BusTripSchema.index({ route: 1, status: 1 });
 BusTripSchema.index({ bus: 1, status: 1 });
+BusTripSchema.index({ driver: 1, createdAt: -1 });

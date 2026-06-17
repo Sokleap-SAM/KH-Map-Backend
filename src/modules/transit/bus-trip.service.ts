@@ -271,7 +271,14 @@ export class BusTripService {
     return this.findOne(id);
   }
 
-  async startTrip(id: Types.ObjectId) {
+  async startTrip(id: Types.ObjectId, driverId?: Types.ObjectId) {
+    // Stamp the operating driver atomically with the status flip so the trip's
+    // history is driver-scoped (survives later bus reassignment).
+    if (driverId) {
+      await this.busTripModel
+        .findByIdAndUpdate(id, { driver: driverId })
+        .exec();
+    }
     return this.update(id, { status: 'in-progress' });
   }
 

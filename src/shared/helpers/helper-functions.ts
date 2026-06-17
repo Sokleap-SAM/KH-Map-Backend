@@ -16,6 +16,15 @@ export function haversineMeters(
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+/** Total length (meters) of a polyline, summed across consecutive segments. */
+export function polylineLengthMeters(coords: Coords[]): number {
+  let total = 0;
+  for (let i = 1; i < coords.length; i++) {
+    total += haversineMeters(coords[i - 1], coords[i]);
+  }
+  return total;
+}
+
 /** Convert a walking distance (meters) to minutes at `walkSpeedKmh`. */
 export function walkMinutes(
   distanceMeters: number,
