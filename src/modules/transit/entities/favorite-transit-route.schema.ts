@@ -5,15 +5,9 @@ import { BaseEntity } from '../../../shared/database/base.entity';
 export type FavoriteTransitRouteDocument =
   HydratedDocument<FavoriteTransitRoute>;
 
-export type SkeletonEndpoint = {
+export type FavoriteEndpoint = {
   name?: string;
   coordinates: [number, number]; // [lng, lat]
-};
-
-export type SkeletonLeg = {
-  route: Types.ObjectId;
-  boardStop: Types.ObjectId;
-  alightStop: Types.ObjectId;
 };
 
 @Schema({ timestamps: true, collection: 'favorite_transit_routes' })
@@ -30,7 +24,7 @@ export class FavoriteTransitRoute extends BaseEntity {
       coordinates: { type: [Number], required: true },
     }),
   )
-  origin!: SkeletonEndpoint;
+  origin!: FavoriteEndpoint;
 
   @Prop(
     raw({
@@ -38,23 +32,7 @@ export class FavoriteTransitRoute extends BaseEntity {
       coordinates: { type: [Number], required: true },
     }),
   )
-  destination!: SkeletonEndpoint;
-
-  @Prop({
-    type: [
-      raw({
-        route: { type: Types.ObjectId, ref: 'BusRoute', required: true },
-        boardStop: { type: Types.ObjectId, ref: 'Place', required: true },
-        alightStop: { type: Types.ObjectId, ref: 'Place', required: true },
-      }),
-    ],
-    required: true,
-    validate: {
-      validator: (v: unknown[]) => Array.isArray(v) && v.length > 0,
-      message: 'A favorite must include at least one transit leg.',
-    },
-  })
-  legs!: SkeletonLeg[];
+  destination!: FavoriteEndpoint;
 }
 
 export const FavoriteTransitRouteSchema =

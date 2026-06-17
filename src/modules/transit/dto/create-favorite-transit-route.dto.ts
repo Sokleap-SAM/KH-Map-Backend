@@ -1,7 +1,7 @@
 import { Type, Transform } from 'class-transformer';
 import {
-  ArrayMinSize,
   ArrayMaxSize,
+  ArrayMinSize,
   IsArray,
   IsNotEmpty,
   IsNumber,
@@ -12,7 +12,7 @@ import {
 } from 'class-validator';
 import { Types } from 'mongoose';
 
-class SkeletonEndpointDto {
+class FavoriteEndpointDto {
   @IsOptional()
   @IsString()
   @MaxLength(120)
@@ -23,20 +23,6 @@ class SkeletonEndpointDto {
   @ArrayMaxSize(2)
   @IsNumber({}, { each: true })
   coordinates!: [number, number]; // [lng, lat]
-}
-
-class SkeletonLegDto {
-  @IsNotEmpty()
-  @Transform(({ value }) => new Types.ObjectId(value as string))
-  route!: Types.ObjectId;
-
-  @IsNotEmpty()
-  @Transform(({ value }) => new Types.ObjectId(value as string))
-  boardStop!: Types.ObjectId;
-
-  @IsNotEmpty()
-  @Transform(({ value }) => new Types.ObjectId(value as string))
-  alightStop!: Types.ObjectId;
 }
 
 export class CreateFavoriteTransitRouteDto {
@@ -50,17 +36,10 @@ export class CreateFavoriteTransitRouteDto {
   label?: string;
 
   @ValidateNested()
-  @Type(() => SkeletonEndpointDto)
-  origin!: SkeletonEndpointDto;
+  @Type(() => FavoriteEndpointDto)
+  origin!: FavoriteEndpointDto;
 
   @ValidateNested()
-  @Type(() => SkeletonEndpointDto)
-  destination!: SkeletonEndpointDto;
-
-  @IsArray()
-  @ArrayMinSize(1)
-  @ArrayMaxSize(6)
-  @ValidateNested({ each: true })
-  @Type(() => SkeletonLegDto)
-  legs!: SkeletonLegDto[];
+  @Type(() => FavoriteEndpointDto)
+  destination!: FavoriteEndpointDto;
 }

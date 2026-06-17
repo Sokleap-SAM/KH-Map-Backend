@@ -1,5 +1,5 @@
 import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
-import { HydratedDocument } from 'mongoose';
+import { HydratedDocument, Types } from 'mongoose';
 import { BaseEntity } from '../../../shared/database/base.entity';
 
 export type BusDocument = HydratedDocument<Bus>;
@@ -22,6 +22,13 @@ export class Bus extends BaseEntity {
     default: 'in-service',
   })
   status?: string;
+
+  // Denormalized pointer back to the driver assigned to this bus. Kept in sync
+  // with User.assignedBusId by the admin assignment endpoint so trip-start
+  // checks ("is this driver allowed to operate this bus?") run without an
+  // extra users-collection lookup.
+  @Prop({ type: Types.ObjectId, ref: 'User', default: null })
+  assignedDriverId?: Types.ObjectId | null;
 }
 
 export const BusSchema = SchemaFactory.createForClass(Bus);

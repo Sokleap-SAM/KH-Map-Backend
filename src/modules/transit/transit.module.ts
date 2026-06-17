@@ -25,6 +25,11 @@ import { BusDispatchService } from './bus-dispatch.service';
 import { FavoriteTransitRouteService } from './favorite-transit-route.service';
 import { OsrmService } from './osrm.service';
 import { ValhallaService } from './valhalla.service';
+import { AppSettingsModule } from '../app-settings/app-settings.module';
+import { UsersModule } from '../users/user.module';
+import { DriverController } from './driver.controller';
+import { DriverService } from './driver.service';
+import { DriverLocationSubscriberService } from './driver-location-subscriber.service';
 
 @Module({
   imports: [
@@ -37,8 +42,10 @@ import { ValhallaService } from './valhalla.service';
       { name: FavoriteTransitRoute.name, schema: FavoriteTransitRouteSchema },
       { name: Place.name, schema: PlaceSchema },
     ]),
+    AppSettingsModule,
+    UsersModule,
   ],
-  controllers: [TransitController],
+  controllers: [TransitController, DriverController],
   providers: [
     BusRouteService,
     BusRouteStopService,
@@ -51,6 +58,8 @@ import { ValhallaService } from './valhalla.service';
     FavoriteTransitRouteService,
     OsrmService,
     ValhallaService,
+    DriverService,
+    DriverLocationSubscriberService,
   ],
   exports: [
     BusRouteService,
