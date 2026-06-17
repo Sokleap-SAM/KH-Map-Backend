@@ -17,7 +17,10 @@ export class PlaceRating extends BaseEntity {
 
   @Prop({ required: true, type: Number, min: 1, max: 5 })
   score!: number;
+
+  @Prop({ required: false, type: [String], default: [] })
+  photos!: string[];
 }
 
 export const PlaceRatingSchema = SchemaFactory.createForClass(PlaceRating);
-PlaceRatingSchema.index({ placeId: 1, userId: 1 });
+PlaceRatingSchema.index({ placeId: 1, userId: 1 }, { unique: true });

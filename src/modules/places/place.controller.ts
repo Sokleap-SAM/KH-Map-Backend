@@ -6,10 +6,14 @@ import {
   Param,
   Patch,
   Post,
+  Request as Req,
   UploadedFiles,
+  UseGuards,
   UseInterceptors,
 } from '@nestjs/common';
+import { Request } from 'express';
 import { Types } from 'mongoose';
+import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { PlaceService } from './place.service';
 import { PlaceCategoryService } from './place-category.service';
 import { PlaceRatingService } from './place-rating.service';
@@ -25,7 +29,16 @@ import {
 } from '@nestjs/platform-express';
 import { createCloudinaryStorage } from '../../config/file-upload.config';
 
+interface AuthenticatedRequest extends Request {
+  user: {
+    userId: string;
+    email: string;
+    role: string;
+  };
+}
+
 const placeStorage = createCloudinaryStorage('places');
+const ratingStorage = createCloudinaryStorage('ratings');
 
 @Controller('places')
 export class PlaceController {
@@ -105,13 +118,17 @@ export class PlaceController {
   }
 
   @Post(':placeId/ratings')
-  @UseInterceptors(AnyFilesInterceptor())
+  @UseGuards(JwtAuthGuard)
+  @UseInterceptors(FilesInterceptor('photos', 10, { storage: ratingStorage }))
   createRating(
+    @Req() req: AuthenticatedRequest,
     @Param('placeId') placeId: string,
     @Body() dto: CreatePlaceRatingDto,
+    @UploadedFiles() files?: Express.Multer.File[],
   ) {
     dto.placeId = new Types.ObjectId(placeId);
-    return this.ratingService.create(dto);
+    dto.userId = new Types.ObjectId(req.user.userId);
+    return this.ratingService.create(dto, files);
   }
 
   @Get(':placeId/ratings')
@@ -136,5 +153,10 @@ export class PlaceController {
   @Delete(':placeId/ratings/:ratingId')
   removeRating(@Param('ratingId') ratingId: string) {
     return this.ratingService.remove(new Types.ObjectId(ratingId));
+  }
+
+  @Post(':placeId/ratings/recompute')
+  recomputeRatings(@Param('placeId') placeId: string) {
+    return this.ratingService.recomputeForPlace(new Types.ObjectId(placeId));
   }
 }

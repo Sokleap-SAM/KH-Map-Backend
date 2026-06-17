@@ -1,23 +1,15 @@
-import {
-  IsInt,
-  IsNotEmpty,
-  IsOptional,
-  IsString,
-  Max,
-  Min,
-} from 'class-validator';
+import { IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
 import { Transform } from 'class-transformer';
 import { Types } from 'mongoose';
 
 export class CreatePlaceRatingDto {
+  // Set from the route param by the controller.
   @IsOptional()
-  placeId: Types.ObjectId;
+  placeId?: Types.ObjectId;
 
-  @IsNotEmpty()
-  @Transform(({ value }) =>
-    value ? new Types.ObjectId(value as string) : null,
-  )
-  userId: Types.ObjectId;
+  // Set from the authenticated JWT by the controller — never trusted from body.
+  @IsOptional()
+  userId?: Types.ObjectId;
 
   @IsOptional()
   @IsString()
