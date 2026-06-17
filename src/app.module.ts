@@ -34,6 +34,7 @@ import { MqttAuthModule } from './modules/mqtt-auth/mqtt-auth.module';
     UsersModule,
     MqttAuthModule,
     SearchHistoryModule,
+    FavoritesModule,
   ],
 })
 export class AppModule {}
