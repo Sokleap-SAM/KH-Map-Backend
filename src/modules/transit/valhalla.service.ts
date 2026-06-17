@@ -42,13 +42,6 @@ export interface WalkRouteResult {
   durationSeconds: number;
 }
 
-export interface WalkMatrixEntry {
-  fromIndex: number;
-  toIndex: number;
-  distanceMeters: number;
-  durationSeconds: number;
-}
-
 // ─── Encoded-polyline decoder (Valhalla uses precision=6) ────────────────────
 
 function decodePolyline6(encoded: string): Coords[] {
@@ -157,27 +150,77 @@ export class ValhallaService {
     }
   }
 
-  // ─── Matrix API: many origins → one destination ────────────────────────────
+  // ─── Single auto (vehicle) route ───────────────────────────────────────────
 
   /**
-   * Batch pedestrian cost from N origin stops to a single destination.
-   * Returns an array in the same order as `origins`.
-   * Null entries mean Valhalla could not find a path (e.g. origin unreachable).
-   *
-   * Use this to pick the best alight stop near the destination, or to rank
-   * seed stops near the origin — all in a single HTTP call.
-   *
+   * Returns the road-snapped driving path between two coordinates using the
+   * `auto` costing model. Used by admin bulk-create flows to compute the
+   * polyline arriving at each bus stop from the previous one.
    * Coords format: [longitude, latitude] (GeoJSON order).
    */
-  async getWalkMatrix(
-    origins: Coords[],
-    destinations: Coords[],
-  ): Promise<Array<WalkMatrixEntry | null>> {
-    if (origins.length === 0 || destinations.length === 0) return [];
+  async getAutoPath(from: Coords, to: Coords): Promise<WalkRouteResult | null> {
+    const body = {
+      locations: [
+        { lon: from[0], lat: from[1], type: 'break' },
+        { lon: to[0], lat: to[1], type: 'break' },
+      ],
+      costing: 'auto',
+      units: 'kilometers',
+      language: 'en-US',
+    };
+
+    try {
+      const res = await fetch(`${this.baseUrl}/route`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(5_000),
+      });
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        this.logger.warn(
+          `[getAutoPath] Valhalla ${res.status}: ${text.slice(0, 120)}`,
+        );
+        return null;
+      }
+
+      const data = (await res.json()) as ValhallaRouteResponse;
+      const leg = data.trip?.legs?.[0];
+      if (!leg) return null;
+
+      return {
+        path: decodePolyline6(leg.shape),
+        distanceMeters: leg.summary.length * 1000,
+        durationSeconds: leg.summary.time,
+      };
+    } catch (err) {
+      this.logger.warn(`[getAutoPath] fetch error: ${(err as Error).message}`);
+      return null;
+    }
+  }
+
+  // ─── Matrix API: full N×M pedestrian matrix ────────────────────────────────
+
+  /**
+   * Full N×M pedestrian matrix — one row per source, one entry per target.
+   * Used by the network cache builder to compute footpath walking times
+   * between every pair of stops in a single batch.
+   *
+   * Caller is responsible for chunking very large requests; this method does
+   * not split internally.
+   */
+  async getWalkMatrixFull(
+    sources: Coords[],
+    targets: Coords[],
+  ): Promise<
+    Array<Array<{ distanceMeters: number; durationSeconds: number } | null>>
+  > {
+    if (sources.length === 0 || targets.length === 0) return [];
 
     const body = {
-      sources: origins.map((c) => ({ lon: c[0], lat: c[1] })),
-      targets: destinations.map((c) => ({ lon: c[0], lat: c[1] })),
+      sources: sources.map((c) => ({ lon: c[0], lat: c[1] })),
+      targets: targets.map((c) => ({ lon: c[0], lat: c[1] })),
       costing: 'pedestrian',
       costing_options: {
         pedestrian: {
@@ -195,50 +238,36 @@ export class ValhallaService {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(8_000),
+        // Allow longer than the single-route timeout because matrix payloads
+        // grow with sources×targets and Valhalla streams the response in one
+        // shot — a too-aggressive timeout kills otherwise-successful batches.
+        signal: AbortSignal.timeout(30_000),
       });
 
       if (!res.ok) {
         const text = await res.text().catch(() => '');
         this.logger.warn(
-          `[getWalkMatrix] Valhalla ${res.status}: ${text.slice(0, 120)}`,
+          `[getWalkMatrixFull] Valhalla ${res.status}: ${text.slice(0, 120)}`,
         );
-        return origins.map(() => null);
+        return sources.map(() => targets.map(() => null));
       }
 
       const data = (await res.json()) as ValhallaMatrixResponse;
-      const matrix = data.sources_to_targets;
-
-      // matrix[sourceIndex][targetIndex]
-      // We want one result per origin (first target for each source row)
-      return matrix.map((row, fromIndex) => {
-        const cell = row[0];
-        if (!cell || cell.time === null || cell.distance === null) return null;
-        return {
-          fromIndex,
-          toIndex: cell.to_index,
-          distanceMeters: cell.distance * 1000,
-          durationSeconds: cell.time,
-        };
-      });
+      return data.sources_to_targets.map((row) =>
+        row.map((cell) => {
+          if (!cell || cell.time === null || cell.distance === null)
+            return null;
+          return {
+            distanceMeters: cell.distance * 1000,
+            durationSeconds: cell.time,
+          };
+        }),
+      );
     } catch (err) {
       this.logger.warn(
-        `[getWalkMatrix] fetch error: ${(err as Error).message}`,
+        `[getWalkMatrixFull] fetch error: ${(err as Error).message}`,
       );
-      return origins.map(() => null);
-    }
-  }
-
-  // ─── Health check ──────────────────────────────────────────────────────────
-
-  async isHealthy(): Promise<boolean> {
-    try {
-      const res = await fetch(`${this.baseUrl}/status`, {
-        signal: AbortSignal.timeout(2_000),
-      });
-      return res.ok;
-    } catch {
-      return false;
+      return sources.map(() => targets.map(() => null));
     }
   }
 }

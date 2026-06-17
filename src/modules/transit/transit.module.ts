@@ -8,6 +8,10 @@ import {
 import { Bus, BusSchema } from './entities/bus.schema';
 import { BusTrip, BusTripSchema } from './entities/bus-trip.schema';
 import { BusLocation, BusLocationSchema } from './entities/bus-location.schema';
+import {
+  FavoriteTransitRoute,
+  FavoriteTransitRouteSchema,
+} from './entities/favorite-transit-route.schema';
 import { Place, PlaceSchema } from '../places/entities/place.schema';
 import { TransitController } from './transit.controller';
 import { BusRouteService } from './bus-route.service';
@@ -17,8 +21,15 @@ import { BusTripService } from './bus-trip.service';
 import { BusLocationService } from './bus-location.service';
 import { TransitRoutingService } from './transit-routing.service';
 import { BusSimulationService } from './bus-simulation.service';
+import { BusDispatchService } from './bus-dispatch.service';
+import { FavoriteTransitRouteService } from './favorite-transit-route.service';
 import { OsrmService } from './osrm.service';
 import { ValhallaService } from './valhalla.service';
+import { AppSettingsModule } from '../app-settings/app-settings.module';
+import { UsersModule } from '../users/user.module';
+import { DriverController } from './driver.controller';
+import { DriverService } from './driver.service';
+import { DriverLocationSubscriberService } from './driver-location-subscriber.service';
 
 @Module({
   imports: [
@@ -28,10 +39,13 @@ import { ValhallaService } from './valhalla.service';
       { name: Bus.name, schema: BusSchema },
       { name: BusTrip.name, schema: BusTripSchema },
       { name: BusLocation.name, schema: BusLocationSchema },
+      { name: FavoriteTransitRoute.name, schema: FavoriteTransitRouteSchema },
       { name: Place.name, schema: PlaceSchema },
     ]),
+    AppSettingsModule,
+    UsersModule,
   ],
-  controllers: [TransitController],
+  controllers: [TransitController, DriverController],
   providers: [
     BusRouteService,
     BusRouteStopService,
@@ -40,8 +54,12 @@ import { ValhallaService } from './valhalla.service';
     BusLocationService,
     TransitRoutingService,
     BusSimulationService,
+    BusDispatchService,
+    FavoriteTransitRouteService,
     OsrmService,
     ValhallaService,
+    DriverService,
+    DriverLocationSubscriberService,
   ],
   exports: [
     BusRouteService,

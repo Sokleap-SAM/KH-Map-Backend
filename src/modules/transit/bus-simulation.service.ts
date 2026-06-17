@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/await-thenable */
 import {
   Injectable,
   Logger,
@@ -8,17 +7,27 @@ import {
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
 import { BusTrip, BusTripDocument } from './entities/bus-trip.schema';
+import { BusRoute, BusRouteDocument } from './entities/bus-route.schema';
 import { BusRouteStopService } from './bus-route-stop.service';
 import { BusLocationService } from './bus-location.service';
+import { BusDispatchService } from './bus-dispatch.service';
 import { BusTripService, TripLiveData } from './bus-trip.service';
 import { BusRouteStop } from './entities/bus-route-stop.schema';
 import { RedisService } from '../../shared/redis/redis.service';
+import { MqttService } from '../../shared/mqtt/mqtt.service';
+import { AppSettingsService } from '../app-settings/app-settings.service';
+import { TransitMode } from '../app-settings/enums/transit-mode.enum';
 import {
   TICK_MS,
   BUS_SIMULATION_SPEED_KMH,
+  BUS_ROUTING_SPEED_KMH,
   SIMULATION_SPEED_M_PER_TICK,
   SYNC_EVERY_N_TICKS,
   SIM_LOCK_TTL_SECONDS,
+  STOP_ARRIVAL_RADIUS_M,
+  DWELL_TIME_MIN,
+  DETAIL_PUBLISH_EVERY_N_TICKS,
+  TRIP_DETAIL_FORWARD_STOPS,
 } from '../../shared/constants/constants';
 import {
   Coords,
@@ -40,6 +49,20 @@ interface TripSimState {
   passengerCount: number;
   waypointIdx: number; // index into segmentCoords the bus is heading toward
   segmentCoords: Coords[]; // road waypoints for the current inter-stop segment
+  /**
+   * Trip status snapshot. `scheduled` buses are "parked" at stop 0 and don't
+   * advance — `advanceBus` publishes their position with `notDepartingUntilMs`
+   * (anchor + headway) so routing can include the queue wait in their ETA.
+   * Transitions to `in-progress` when dispatch promotes the trip.
+   */
+  status: 'in-progress' | 'scheduled';
+  /**
+   * Wall-clock timestamp (ms) until which the bus is dwelling at its current
+   * stop and should not move. Set when the bus arrives at an intermediate
+   * stop so the on-map bus matches the dwell time baked into routing costs.
+   * Undefined when the bus is in motion.
+   */
+  dwellUntilMs?: number;
 }
 
 // ─── Geometry helpers ─────────────────────────────────────────────────────────
@@ -64,6 +87,10 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
   /** Route stop lists — loaded once per route and reused across ticks. */
   private readonly routeStopCache = new Map<string, BusRouteStop[]>();
 
+  /** Per-route headway in minutes, refreshed lazily. Used by parked-bus
+   *  position publication to compute `notDepartingUntilMs`. */
+  private readonly routeHeadwayCache = new Map<string, number>();
+
   private intervalHandle: ReturnType<typeof setInterval> | null = null;
   private tickCount = 0;
   /** Prevents a slow tick from stacking behind a queued setInterval callback. */
@@ -80,14 +107,26 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
   constructor(
     @InjectModel(BusTrip.name)
     private readonly busTripModel: Model<BusTripDocument>,
+    @InjectModel(BusRoute.name)
+    private readonly busRouteModel: Model<BusRouteDocument>,
     private readonly busRouteStopService: BusRouteStopService,
     private readonly busLocationService: BusLocationService,
     private readonly busTripService: BusTripService,
+    private readonly busDispatchService: BusDispatchService,
     private readonly redisService: RedisService,
+    private readonly mqttService: MqttService,
+    private readonly appSettings: AppSettingsService,
   ) {}
 
+  /** Tracks whether the caller wants the simulator running, even if start
+   *  hasn't actually succeeded yet (e.g. waiting for Redis to come up). */
+  private wantedRunning = false;
+  private startRetryHandle: ReturnType<typeof setTimeout> | null = null;
+
   async onModuleInit(): Promise<void> {
-    await this.start();
+    // Don't await — start() may schedule retries (Redis warming up) and we
+    // mustn't block the Nest bootstrap on that.
+    void this.start();
   }
 
   onModuleDestroy(): void {
@@ -96,22 +135,74 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
 
   // ─── Public API ────────────────────────────────────────────────────────────
 
-  /** Start the simulation loop. No-op if already running. */
+  /**
+   * Start the simulation loop. No-op if already running. Safe to call before
+   * Redis is connected — the lock acquisition is retried until it succeeds
+   * (or {@link stop} cancels the intent).
+   */
   async start(): Promise<void> {
+    this.wantedRunning = true;
+    await this.attemptStart();
+  }
+
+  private async attemptStart(): Promise<void> {
+    if (!this.wantedRunning) return; // cancelled by stop() while retrying
     if (this._running) return;
+
+    // Real-world mode: drivers run the buses, the simulator must not move
+    // them. Refuse to start so a stale `await start()` from boot doesn't
+    // resurrect the sim loop after admin flipped to live.
+    if (this.appSettings.getMode() === TransitMode.LIVE) {
+      this.logger.log('Transit mode = live, simulation start skipped');
+      return;
+    }
 
     // Acquire a distributed lock so only one instance runs the simulation.
     // On single-instance deploys this is a no-op; on multi-instance it prevents
     // duplicate simulations that would advance buses 2×/3× too fast.
-    const acquired = await this.redisService.setnx(
-      BusSimulationService.LOCK_KEY,
-      this.instanceId,
-      SIM_LOCK_TTL_SECONDS,
-    );
-    if (!acquired) {
-      this.logger.warn(
-        `Simulation lock held by another instance — this instance (${this.instanceId}) will not start.`,
+    let acquired = false;
+    try {
+      acquired = await this.redisService.setnx(
+        BusSimulationService.LOCK_KEY,
+        this.instanceId,
+        SIM_LOCK_TTL_SECONDS,
       );
+    } catch (err) {
+      // Defensive — setnx already catches in RedisService, but keep this in
+      // case the underlying client throws synchronously during boot.
+      this.logger.warn(
+        `Simulation start: Redis error (${(err as Error).message}). Retrying in 5 s.`,
+      );
+    }
+
+    if (!acquired) {
+      // Two reasons we land here: Redis isn't ready yet (boot race) OR
+      // another instance owns the lock. Retry either way — when Redis comes
+      // up we'll get it; when the other instance dies its TTL will free it.
+      // Surface the lock holder + TTL when we can, so a stale lock from a
+      // crashed instance is obvious in the log instead of an opaque retry loop.
+      let detail = this.redisService.isReady()
+        ? 'lock held'
+        : 'Redis warming up';
+      if (this.redisService.isReady()) {
+        try {
+          const holder = await this.redisService.get<string>(
+            BusSimulationService.LOCK_KEY,
+          );
+          detail = holder
+            ? `lock held by instance=${holder}`
+            : 'lock held (holder unknown)';
+        } catch {
+          // ignore — log the original reason
+        }
+      }
+      this.logger.warn(
+        `Simulation start deferred (${detail}, this instance=${this.instanceId}). Retrying in 5 s.`,
+      );
+      this.startRetryHandle = setTimeout(() => {
+        this.startRetryHandle = null;
+        void this.attemptStart();
+      }, 5_000);
       return;
     }
 
@@ -125,6 +216,12 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
 
   /** Stop the loop and clear all in-memory state. No-op if already stopped. */
   stop(): void {
+    // Cancel any pending start retry first so we don't undo this stop.
+    this.wantedRunning = false;
+    if (this.startRetryHandle) {
+      clearTimeout(this.startRetryHandle);
+      this.startRetryHandle = null;
+    }
     if (!this._running) return;
     this._running = false;
     clearInterval(this.intervalHandle!);
@@ -144,16 +241,38 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
     return this.trips.size;
   }
 
+  /**
+   * DEV ONLY: drop every in-memory trip and route-stop cache entry so the
+   * simulator stops tracking any buses immediately. The next `syncActiveTrips`
+   * tick reads from a clean Mongo collection. Used by the admin reset endpoint.
+   */
+  clearInMemoryState(): void {
+    this.trips.clear();
+    this.routeStopCache.clear();
+    this.routeHeadwayCache.clear();
+  }
+
   // ─── Tick ──────────────────────────────────────────────────────────────────
 
   private async runTick(): Promise<void> {
     if (this.processing) return; // drop tick if previous still in-flight
+    // Defence-in-depth: stop() is called explicitly when admin flips to live,
+    // but if a tick somehow fires after the flip (race with setInterval),
+    // bail so the simulator never moves a real-world bus.
+    if (this.appSettings.getMode() === TransitMode.LIVE) return;
     this.processing = true;
     this.tickCount++;
 
     try {
+      // Run trip sync in the background — a slow Mongo query mustn't block
+      // the per-tick bus advance. Worst case the simulator operates on the
+      // previous trip list for one extra tick (~1 s), which is invisible
+      // to clients; whereas an awaited sync that takes 3 s causes a visible
+      // 3 s freeze in every bus on the map.
       if (this.tickCount % SYNC_EVERY_N_TICKS === 1) {
-        await this.syncActiveTrips();
+        this.syncActiveTrips().catch((err: unknown) =>
+          this.logger.error('syncActiveTrips failed', err),
+        );
       }
       if (this.trips.size === 0) return;
       await Promise.all(
@@ -180,18 +299,51 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
       .expire(BusSimulationService.LOCK_KEY, SIM_LOCK_TTL_SECONDS)
       .catch((err: unknown) => this.logger.warn('Lock renewal failed', err));
 
+    // Pull both in-progress AND scheduled trips. Scheduled buses are tracked
+    // so their position (at stop 0, with `notDepartingUntilMs`) is published
+    // to Redis — routing then includes them in the live-ETA map with the
+    // remaining queue wait baked in, so the frontend can show their bus ID
+    // for the "view bus details" button just like any moving bus.
     const active = await this.busTripModel
-      .find({ status: 'in-progress' })
+      .find({ status: { $in: ['in-progress', 'scheduled'] } })
       .lean()
       .exec();
 
     const activeIds = new Set(active.map((t) => String(t._id)));
 
-    // Evict trips no longer in-progress
+    // Evict trips no longer in-progress or scheduled (completed, cancelled,
+    // removed). Clear their Redis live-position keys so `getLivePositionsByRoute`
+    // stops returning them.
     for (const id of this.trips.keys()) {
       if (!activeIds.has(id)) {
+        const evicted = this.trips.get(id);
         this.trips.delete(id);
+        if (evicted) {
+          this.busLocationService
+            .clearLocation(id, evicted.routeId)
+            .catch((err: unknown) =>
+              this.logger.warn(
+                `Failed to clear Redis location for trip ${id}`,
+                err,
+              ),
+            );
+        }
         this.logger.verbose(`Evicted trip ${id}`);
+      }
+    }
+
+    // Detect status transitions for already-tracked trips (most commonly:
+    // dispatch promoted a scheduled bus to in-progress).
+    for (const t of active) {
+      const id = String(t._id);
+      const existing = this.trips.get(id);
+      if (!existing) continue;
+      const newStatus = t.status as 'in-progress' | 'scheduled';
+      if (existing.status !== newStatus) {
+        existing.status = newStatus;
+        this.logger.verbose(
+          `Trip ${id} transitioned to ${newStatus} on route ${existing.routeId}`,
+        );
       }
     }
 
@@ -209,6 +361,13 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
     if (active.length > 0) {
       this.logger.debug(`Tracking ${this.trips.size}/${active.length} trips`);
     }
+
+    // Dispatch: bootstrap empty routes, promote scheduled trips after
+    // headway, and re-queue completed buses. Fire-and-forget so DB latency
+    // doesn't block the simulator sync.
+    this.busDispatchService
+      .run()
+      .catch((err: unknown) => this.logger.warn('Dispatch run failed', err));
   }
 
   /**
@@ -221,6 +380,7 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
     const tripId = String(trip._id);
     const routeId = String(trip.route);
     const stops = await this.getRouteStops(routeId);
+    const tripStatus = trip.status as 'in-progress' | 'scheduled';
 
     if (stops.length === 0) {
       this.logger.warn(
@@ -253,6 +413,20 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
         latitude: pos[1],
         ...meta,
       });
+      // Anchor the route's "last departure from first stop" only when the
+      // bus actually started moving (in-progress). Scheduled buses are
+      // still parked — their anchor was set by dispatch when the *previous*
+      // bus on the route departed.
+      if (tripStatus === 'in-progress') {
+        this.busLocationService
+          .setRouteDepartureAnchor(routeId, Date.now())
+          .catch((err: unknown) =>
+            this.logger.warn(
+              `Failed to set departure anchor for route ${routeId}`,
+              err,
+            ),
+          );
+      }
     } else {
       pos = [live.longitude, live.latitude];
       currentStopIdx = live.currentStopIndex;
@@ -279,10 +453,11 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
       passengerCount,
       waypointIdx,
       segmentCoords,
+      status: tripStatus,
     });
 
     this.logger.verbose(
-      `Trip ${tripId} initialised at stop ${currentStopIdx}→${nextStopIdx}${isStale ? ' (reset)' : ''}`,
+      `Trip ${tripId} initialised as ${tripStatus} at stop ${currentStopIdx}→${nextStopIdx}${isStale ? ' (reset)' : ''}`,
     );
   }
 
@@ -295,10 +470,29 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
     const stops = this.routeStopCache.get(state.routeId);
     if (!stops) return;
 
+    // Parked (scheduled) bus: don't move, just publish a position at stop 0
+    // with the expected departure timestamp so routing can include the
+    // queue wait in its ETA at downstream stops. The dispatch service flips
+    // this trip to 'in-progress' when its headway elapses.
+    if (state.status === 'scheduled') {
+      await this.advanceParkedBus(state, stops);
+      return;
+    }
+
     if (state.nextStopIdx >= stops.length) {
       await this.completeTrip(state, stops);
       return;
     }
+
+    // Dwell handling: while the bus is dwelling at a stop it doesn't move,
+    // but we MUST keep publishing the stationary position every tick.
+    // Otherwise the frontend's MQTT stream goes silent and most clients drop
+    // the bus from the map after a few seconds, then "respawn" it when motion
+    // resumes — the visible disappearance bug.
+    if (state.dwellUntilMs && Date.now() >= state.dwellUntilMs) {
+      state.dwellUntilMs = undefined;
+    }
+    const isDwelling = state.dwellUntilMs !== undefined;
 
     // Move the bus along the waypoint chain by SIMULATION_SPEED_M_PER_TICK metres.
     // When the bus exhausts a segment it snaps to the stop and immediately continues
@@ -306,55 +500,79 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
     let pos = state.pos;
     let waypointIdx = state.waypointIdx;
     let segCoords = state.segmentCoords;
-    let remaining = SIMULATION_SPEED_M_PER_TICK;
 
-    while (remaining > 0.01) {
-      if (waypointIdx >= segCoords.length) {
-        // Bus has consumed the entire waypoint chain — arrived at the next stop.
-        const arrivedIdx = state.nextStopIdx;
-        const newNextIdx = arrivedIdx + 1;
+    if (!isDwelling) {
+      let remaining = SIMULATION_SPEED_M_PER_TICK;
+      while (remaining > 0.01) {
+        // Arrival detection: if we're within STOP_ARRIVAL_RADIUS_M of the
+        // next stop's stored coordinates, treat as arrived and load the next
+        // segment. This handles the case where the segmentPath's last
+        // waypoint isn't exactly at the stop (data inconsistency) — without
+        // this check the bus can sit a few metres short of the stop and the
+        // segment-end branch below never triggers.
+        const nextStopCoords = stopCoords(stops[state.nextStopIdx].stop);
+        const distToNextStop = haversineMeters(pos, nextStopCoords);
+        const reachedByProximity = distToNextStop <= STOP_ARRIVAL_RADIUS_M;
+        const reachedByWaypoints = waypointIdx >= segCoords.length;
 
-        if (newNextIdx >= stops.length) {
-          // Last stop reached — commit position and reset trip.
-          state.pos = pos;
+        if (reachedByProximity || reachedByWaypoints) {
+          // Arrived at the next stop.
+          const arrivedIdx = state.nextStopIdx;
+          const newNextIdx = arrivedIdx + 1;
+
+          if (newNextIdx >= stops.length) {
+            // Last stop reached — commit position and reset trip.
+            state.pos = pos;
+            state.currentStopIdx = arrivedIdx;
+            state.nextStopIdx = newNextIdx;
+            state.waypointIdx = waypointIdx;
+            state.segmentCoords = segCoords;
+            await this.completeTrip(state, stops);
+            return;
+          }
+
+          // Snap to stop and start the dwell window. We don't consume the
+          // remaining tick budget on the next segment — doing so would skip
+          // dwell and let the bus outrun routing's predictions. Break out
+          // so the unified publish at the bottom still fires (Redis + MQTT)
+          // and the frontend sees the bus parked at the stop.
+          pos = nextStopCoords;
           state.currentStopIdx = arrivedIdx;
           state.nextStopIdx = newNextIdx;
-          state.waypointIdx = waypointIdx;
-          state.segmentCoords = segCoords;
-          await this.completeTrip(state, stops);
-          return;
+          segCoords = this.buildSegmentCoords(stops, newNextIdx, pos);
+          waypointIdx = 1;
+          state.dwellUntilMs = Date.now() + DWELL_TIME_MIN * 60_000;
+          break;
         }
 
-        // Snap to stop and load the next inter-stop segment.
-        pos = stopCoords(stops[arrivedIdx].stop);
-        state.currentStopIdx = arrivedIdx;
-        state.nextStopIdx = newNextIdx;
-        segCoords = this.buildSegmentCoords(stops, newNextIdx, pos);
-        waypointIdx = 1;
-        // The remaining distance is consumed on the new segment — loop continues.
-        continue;
-      }
+        const target = segCoords[waypointIdx];
+        const dist = haversineMeters(pos, target);
 
-      const target = segCoords[waypointIdx];
-      const dist = haversineMeters(pos, target);
-
-      if (dist <= remaining) {
-        // Reached this waypoint — continue toward the next
-        pos = target;
-        remaining -= dist;
-        waypointIdx++;
-      } else {
-        // Partial move toward this waypoint
-        const ratio = remaining / dist;
-        pos = [
-          pos[0] + (target[0] - pos[0]) * ratio,
-          pos[1] + (target[1] - pos[1]) * ratio,
-        ];
-        remaining = 0;
+        if (dist <= remaining) {
+          // Reached this waypoint — continue toward the next
+          pos = target;
+          remaining -= dist;
+          waypointIdx++;
+        } else {
+          // Partial move toward this waypoint
+          const ratio = remaining / dist;
+          pos = [
+            pos[0] + (target[0] - pos[0]) * ratio,
+            pos[1] + (target[1] - pos[1]) * ratio,
+          ];
+          remaining = 0;
+        }
       }
     }
 
-    const heading = this.headingFromState(segCoords, pos, waypointIdx);
+    // Heading is meaningless while dwelling (the bus isn't moving), so we
+    // publish 0; once dwell ends the next tick computes a real heading.
+    const heading = isDwelling
+      ? 0
+      : this.headingFromState(segCoords, pos, waypointIdx);
+    // Reported speed mirrors actual motion so live ETAs and the UI don't
+    // imply the bus is still moving while it dwells.
+    const reportedSpeed = isDwelling ? 0 : Math.round(BUS_SIMULATION_SPEED_KMH);
 
     state.pos = pos;
     state.waypointIdx = waypointIdx;
@@ -381,63 +599,181 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
         longitude: pos[0],
         latitude: pos[1],
         heading,
-        speed: Math.round(BUS_SIMULATION_SPEED_KMH),
+        speed: reportedSpeed,
         currentStopIndex: state.currentStopIdx,
       })
       .catch((err: unknown) => this.logger.error('reportLocation failed', err));
-  }
 
-  /** Reset the trip to `scheduled`, clear Redis live data, and evict from memory. */
-  private async completeTrip(
-    state: TripSimState,
-    stops: BusRouteStop[],
-  ): Promise<void> {
-    // Restart automatically from the first stop — no manual intervention needed.
-    const pos = stopCoords(stops[0].stop);
-    const nextStopIdx = stops.length > 1 ? 1 : 0;
-
-    state.pos = pos;
-    state.currentStopIdx = 0;
-    state.nextStopIdx = nextStopIdx;
-    state.waypointIdx = 1;
-    state.passengerCount = 0;
-    state.segmentCoords = this.buildSegmentCoords(stops, nextStopIdx, pos);
-
-    // Use writeWithTimeout so a hanging Redis connection cannot freeze all buses
-    // at the loop-back point. The in-memory state is already reset above.
-    await this.writeWithTimeout(state.tripId, {
-      currentStopIndex: 0,
-      nextStopIndex: nextStopIdx,
-      passengerCount: 0,
-      longitude: pos[0],
-      latitude: pos[1],
-      heading: 0,
-      busImage: '',
-    });
-
-    // Publish the new position to bus:trip:{tripId}:location and the geo set
-    // so getLivePositionsByRoute() immediately sees the bus at stop[0].
-    // Without this, the routing ETA query reads stale coordinates from before
-    // the loop and computes wrong ETAs for all stops.
-    // Reuse state.segmentCoords already computed above — no need to rebuild.
-    const heading =
-      stops.length > 1 ? this.headingFromState(state.segmentCoords, pos, 1) : 0;
-    this.busLocationService
-      .reportLocation({
-        busId: state.busId,
+    // Push to MQTT subscribers. `retain: true` so a frontend that connects
+    // after this tick still receives the last known position immediately on
+    // subscribe (no need to hit the HTTP endpoint for initial state). QoS 0
+    // because the next tick (~1 s) supersedes anything dropped in transit.
+    this.mqttService.publish(
+      `transit/route/${state.routeId}/position`,
+      {
         tripId: state.tripId,
+        busId: state.busId,
         routeId: state.routeId,
         longitude: pos[0],
         latitude: pos[1],
         heading,
-        speed: Math.round(BUS_SIMULATION_SPEED_KMH),
-        currentStopIndex: 0,
-      })
+        speed: reportedSpeed,
+        currentStopIndex: state.currentStopIdx,
+        recordedAt: new Date().toISOString(),
+      },
+      { qos: 0, retain: true },
+    );
+
+    // Throttled visibility log so a multi-bus sim doesn't spam stdout. Logs
+    // once per DETAIL_PUBLISH_EVERY_N_TICKS per bus — same cadence as the
+    // detail topic, ~1 line per bus per 3 s.
+    if (this.tickCount % DETAIL_PUBLISH_EVERY_N_TICKS === 0) {
+      this.logger.log(
+        `[sim] bus=${state.busId} trip=${state.tripId} route=${state.routeId} @ ${pos[0].toFixed(5)},${pos[1].toFixed(5)} spd=${reportedSpeed}`,
+      );
+    }
+
+    // Per-trip detail topic, throttled to DETAIL_PUBLISH_EVERY_N_TICKS. The
+    // map-view subscribers only need position (above); the bus-detail card
+    // wants richer data (ETAs to upcoming stops, passenger count). Different
+    // cadence and payload size — separate topic keeps each audience lean.
+    if (this.tickCount % DETAIL_PUBLISH_EVERY_N_TICKS === 0) {
+      this.mqttService.publish(
+        `transit/trip/${state.tripId}/detail`,
+        this.buildTripDetail(state, stops, pos, heading, reportedSpeed),
+        { qos: 0, retain: true },
+      );
+    }
+  }
+
+  /**
+   * Build the per-trip detail payload published on `transit/trip/<tripId>/detail`.
+   * Includes the bus's current position plus ETAs for the next few upcoming
+   * stops. Returns null for the next-stop ETA when the trip has finished its
+   * route (caller should suppress that case before invoking).
+   *
+   * ETA strategy:
+   *   - Next stop: `haversine(currentPos, nextStop) / BUS_SIMULATION_SPEED_KMH`
+   *     — matches what the user sees on the map.
+   *   - Subsequent stops: routing speed + per-stop dwell. Keeps the detail
+   *     ETAs consistent with what the planner displays in route plans, so a
+   *     user comparing the two doesn't see contradictory minutes.
+   */
+  private buildTripDetail(
+    state: TripSimState,
+    stops: BusRouteStop[],
+    pos: Coords,
+    heading: number,
+    reportedSpeed: number,
+  ): Record<string, unknown> {
+    const upcoming: Array<{
+      stopId: string;
+      name: string;
+      etaMinutes: number;
+    }> = [];
+    let etaNextStopMin: number | null = null;
+
+    if (state.nextStopIdx < stops.length) {
+      const nextStop = stops[state.nextStopIdx];
+      const nextCoords = stopCoords(nextStop.stop);
+      const distToNextM = haversineMeters(pos, nextCoords);
+      const nextEtaMin = (distToNextM / 1000 / BUS_SIMULATION_SPEED_KMH) * 60;
+      etaNextStopMin = Math.max(0, Math.round(nextEtaMin * 10) / 10);
+
+      const nextStopRef = nextStop.stop as unknown as {
+        _id?: { toString(): string };
+        name?: string;
+      };
+      let cumMin = nextEtaMin;
+      upcoming.push({
+        stopId: nextStopRef._id?.toString() ?? '',
+        name: nextStopRef.name ?? '',
+        etaMinutes: etaNextStopMin,
+      });
+
+      for (
+        let i = state.nextStopIdx + 1;
+        i < stops.length && upcoming.length < TRIP_DETAIL_FORWARD_STOPS;
+        i++
+      ) {
+        const prev = stops[i - 1];
+        const curr = stops[i];
+        const segDist = haversineMeters(
+          stopCoords(prev.stop),
+          stopCoords(curr.stop),
+        );
+        cumMin +=
+          (segDist / 1000 / BUS_ROUTING_SPEED_KMH) * 60 + DWELL_TIME_MIN;
+        const currRef = curr.stop as unknown as {
+          _id?: { toString(): string };
+          name?: string;
+        };
+        upcoming.push({
+          stopId: currRef._id?.toString() ?? '',
+          name: currRef.name ?? '',
+          etaMinutes: Math.max(0, Math.round(cumMin * 10) / 10),
+        });
+      }
+    }
+
+    return {
+      tripId: state.tripId,
+      busId: state.busId,
+      routeId: state.routeId,
+      longitude: pos[0],
+      latitude: pos[1],
+      heading,
+      speed: reportedSpeed,
+      currentStopIndex: state.currentStopIdx,
+      nextStopIndex: state.nextStopIdx,
+      etaNextStopMin,
+      upcomingStops: upcoming,
+      passengerCount: state.passengerCount,
+      recordedAt: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * Handle a trip reaching the last stop of its route. Under the new
+   * dispatch model the bus does NOT automatically loop back — instead the
+   * trip is marked completed, the bus is either re-queued or goes idle
+   * (decided by {@link BusDispatchService.onTripCompleted}), and the
+   * simulator drops it from in-memory state. The next dispatch tick will
+   * promote a scheduled trip to in-progress when headway elapses and
+   * `initTrip` will re-spawn the bus at stop 0 then.
+   */
+  private async completeTrip(
+    state: TripSimState,
+    _stops: BusRouteStop[],
+  ): Promise<void> {
+    const tripId = state.tripId;
+    const routeId = state.routeId;
+    const busId = state.busId;
+
+    // Evict in-memory state first so the next tick doesn't try to advance a
+    // bus whose trip is being marked completed.
+    this.trips.delete(tripId);
+
+    // Clear Redis live position so `getLivePositionsByRoute` immediately
+    // stops returning this bus (otherwise routing keeps seeing a phantom
+    // bus parked at the last stop until the 24 h TTL).
+    this.busLocationService
+      .clearLocation(tripId, routeId)
       .catch((err: unknown) =>
-        this.logger.error('reportLocation failed on loop', err),
+        this.logger.warn(`Failed to clear location for trip ${tripId}`, err),
       );
 
-    this.logger.log(`Trip ${state.tripId} completed — looping back to start`);
+    // Mark trip completed in Mongo and let the dispatch service decide
+    // whether to re-queue this bus or release it.
+    try {
+      await this.busDispatchService.onTripCompleted(tripId, busId, routeId);
+    } catch (err) {
+      this.logger.error(`Trip completion handling failed for ${tripId}`, err);
+    }
+
+    this.logger.log(
+      `Trip ${tripId} completed — bus ${busId} handed off to dispatch`,
+    );
   }
 
   // ─── Helpers ───────────────────────────────────────────────────────────────
@@ -458,6 +794,99 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
       );
     }
     return 0;
+  }
+
+  /**
+   * Per-tick advance for parked (scheduled) buses. The bus doesn't move;
+   * we just refresh its Redis position at stop 0 along with the projected
+   * departure time. Routing reads `notDepartingUntilMs` and adds the
+   * remaining wait to every downstream stop ETA so the parked bus shows
+   * up as a live boarding candidate in plan responses (with the queue
+   * delay baked in).
+   *
+   * Departure time = anchor + headway × queuePosition. With dispatch's
+   * "exactly one scheduled at a time" invariant, the parked bus is always
+   * queue position 1 — so departure = anchor + headway. If the anchor or
+   * headway is unavailable we skip publication (the bus stays invisible
+   * for that tick).
+   */
+  private async advanceParkedBus(
+    state: TripSimState,
+    stops: BusRouteStop[],
+  ): Promise<void> {
+    const headwayMin = await this.getRouteHeadway(state.routeId);
+    if (headwayMin == null) return;
+
+    const anchors = await this.busLocationService.getRouteDepartureAnchors([
+      state.routeId,
+    ]);
+    const anchorMs = anchors.get(state.routeId);
+    if (anchorMs === undefined) return;
+
+    const stop0 = stopCoords(stops[0].stop);
+    const notDepartingUntilMs = anchorMs + headwayMin * 60_000;
+    state.pos = stop0;
+    state.currentStopIdx = 0;
+
+    // Publish to Redis (live ETA query reads this) + MQTT (frontend map).
+    this.busLocationService
+      .reportLocation({
+        busId: state.busId,
+        tripId: state.tripId,
+        routeId: state.routeId,
+        longitude: stop0[0],
+        latitude: stop0[1],
+        heading: 0,
+        speed: 0,
+        currentStopIndex: 0,
+        notDepartingUntilMs,
+      })
+      .catch((err: unknown) =>
+        this.logger.warn(
+          `Parked bus reportLocation failed for trip ${state.tripId}`,
+          err,
+        ),
+      );
+
+    this.mqttService.publish(
+      `transit/route/${state.routeId}/position`,
+      {
+        tripId: state.tripId,
+        busId: state.busId,
+        routeId: state.routeId,
+        longitude: stop0[0],
+        latitude: stop0[1],
+        heading: 0,
+        speed: 0,
+        currentStopIndex: 0,
+        notDepartingUntilMs,
+        status: 'scheduled',
+        recordedAt: new Date().toISOString(),
+      },
+      { qos: 0, retain: true },
+    );
+  }
+
+  /** Return cached headwayMinutes for a route. Returns null if the route is
+   *  unknown or has no headway configured (in which case parked buses can't
+   *  be published since departure time is undefined). */
+  private async getRouteHeadway(routeId: string): Promise<number | null> {
+    const cached = this.routeHeadwayCache.get(routeId);
+    if (cached !== undefined) return cached;
+    try {
+      const route = await this.busRouteModel
+        .findById(routeId, 'headwayMinutes')
+        .lean()
+        .exec();
+      const hw = route?.headwayMinutes ?? null;
+      if (hw != null) this.routeHeadwayCache.set(routeId, hw);
+      return hw;
+    } catch (err) {
+      this.logger.warn(
+        `getRouteHeadway failed for ${routeId}: ${(err as Error).message}`,
+      );
+      return null;
+    }
   }
 
   /** Return cached route stops, fetching from DB on first access. */
@@ -489,38 +918,6 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
       }
     }
     return bestIdx;
-  }
-
-  /**
-   * Write live position to Redis with a hard timeout so a hanging Redis
-   * connection never keeps `this.processing = true` indefinitely.
-   * If the write fails or times out, the bus state is already updated in
-   * memory and Redis will catch up on the next successful tick.
-   */
-  private async writeWithTimeout(
-    tripId: string,
-    liveData: TripLiveData,
-  ): Promise<void> {
-    let handle: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await Promise.race([
-        this.busTripService.setLiveData(tripId, liveData),
-        new Promise<never>(
-          (_, reject) =>
-            (handle = setTimeout(
-              () => reject(new Error('Redis write timeout')),
-              2_000,
-            )),
-        ),
-      ]);
-    } catch (err) {
-      this.logger.warn(
-        `Redis write skipped for trip ${tripId} — will retry next tick`,
-        err,
-      );
-    } finally {
-      clearTimeout(handle);
-    }
   }
 
   /**

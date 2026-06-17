@@ -48,4 +48,14 @@ export class ReportBusLocationDto {
   @Min(0)
   @IsOptional()
   currentStopIndex?: number;
+
+  /**
+   * For parked/queued buses: wall-clock ms at which this bus is expected to
+   * depart stop 0. Routing adds the remaining wait to every downstream stop
+   * ETA so users see "Bus in N min" inclusive of the queue delay.
+   */
+  @IsNumber()
+  @Min(0)
+  @IsOptional()
+  notDepartingUntilMs?: number;
 }

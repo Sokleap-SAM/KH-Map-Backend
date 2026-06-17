@@ -6,15 +6,23 @@ import { BusLocation } from './entities/bus-location.schema';
 import { ReportBusLocationDto } from './dto/report-bus-location.dto';
 import { BUS_LOCATION_DB_WRITE_INTERVAL_MS } from '../../shared/constants/constants';
 import { BUS_LOCATION_TTL_SECONDS } from '../../shared/constants/constants';
+import { ROUTE_DEPARTURE_ANCHOR_TTL_SECONDS } from '../../shared/constants/constants';
 
 /** Redis key: latest ping metadata per trip */
 const tripKey = (tripId: string) => `bus:trip:${tripId}:location`;
 /** Redis geo set: all active bus positions keyed by tripId, grouped per route */
 const routeGeoKey = (routeId: string) => `bus:route:${routeId}:geo`;
+/** Redis key: wall-clock timestamp (ms) of the last bus departure from a route's first stop. */
+const routeDepartureAnchorKey = (routeId: string) =>
+  `route:lastDeparture:${routeId}`;
 
 export interface LiveBusPosition {
   tripId: string;
   routeId: string;
+  /** Mongo ObjectId (as string) of the Bus operating this trip. Needed so
+   *  plan responses can include `busId` on each bus segment for the
+   *  frontend's "view bus details" button. */
+  busId?: string;
   longitude: number;
   latitude: number;
   heading: number | null;
@@ -22,6 +30,14 @@ export interface LiveBusPosition {
   recordedAt: string; // ISO string
   /** Index of the last stop the bus departed from — used to prevent "already passed" boarding. */
   currentStopIndex?: number;
+  /**
+   * Wall-clock timestamp (ms) at which a *scheduled* bus is expected to leave
+   * stop 0. Set on parked-queue buses by the simulator; absent for actively
+   * moving (in-progress) buses. The routing service adds the "until departure"
+   * delta to every projected stop ETA so a scheduled bus's downstream arrivals
+   * include the queue wait.
+   */
+  notDepartingUntilMs?: number;
 }
 
 @Injectable()
@@ -48,12 +64,14 @@ export class BusLocationService {
     const payload: LiveBusPosition = {
       tripId: dto.tripId,
       routeId: dto.routeId,
+      busId: dto.busId,
       longitude: dto.longitude,
       latitude: dto.latitude,
       heading: dto.heading ?? null,
       speed: dto.speed ?? null,
       recordedAt: now.toISOString(),
       currentStopIndex: dto.currentStopIndex,
+      notDepartingUntilMs: dto.notDepartingUntilMs,
     };
     await Promise.all([
       this.redisService.set(
@@ -103,12 +121,82 @@ export class BusLocationService {
           recordedAt: now,
         },
       },
-      { upsert: true, new: true },
+      { upsert: true, returnDocument: 'after' },
     );
   }
 
   async getLivePosition(tripId: string): Promise<LiveBusPosition | null> {
     return this.redisService.get<LiveBusPosition>(tripKey(tripId));
+  }
+
+  /**
+   * Remove all live-position traces for a trip from Redis. Call this when a
+   * trip is cancelled, completed, or evicted from the simulator — otherwise
+   * the trip key (`bus:trip:{tripId}:location`) and its entry in the route
+   * geo set (`bus:route:{routeId}:geo`) linger until their 24h TTL expires
+   * and keep showing up in `getLivePositionsByRoute`, which is what feeds
+   * live ETAs into the routing service.
+   *
+   * If `routeId` is unknown to the caller we read it out of the trip key
+   * first; if the trip key is already gone we still attempt the geo remove
+   * via best-effort delete on common route keys (no-op in practice).
+   */
+  async clearLocation(tripId: string, routeId?: string): Promise<void> {
+    let resolvedRouteId = routeId;
+    if (!resolvedRouteId) {
+      const existing = await this.redisService.get<LiveBusPosition>(
+        tripKey(tripId),
+      );
+      resolvedRouteId = existing?.routeId;
+    }
+    await Promise.all([
+      this.redisService.del(tripKey(tripId)),
+      resolvedRouteId
+        ? this.redisService.georemove(routeGeoKey(resolvedRouteId), tripId)
+        : Promise.resolve(),
+    ]);
+  }
+
+  /**
+   * Record that a bus has just departed (or is about to depart) the first stop
+   * of the given route. The routing service uses this anchor to project
+   * deterministic next-lap arrivals at every downstream stop, eliminating the
+   * flicker that comes from purely wall-clock-based headway projection.
+   *
+   * Overwrites any previous anchor — the most recent stop-0 departure is the
+   * only one we need to project forward by headway.
+   */
+  async setRouteDepartureAnchor(
+    routeId: string,
+    timestampMs: number,
+  ): Promise<void> {
+    await this.redisService.set(
+      routeDepartureAnchorKey(routeId),
+      timestampMs,
+      ROUTE_DEPARTURE_ANCHOR_TTL_SECONDS,
+    );
+  }
+
+  /**
+   * Bulk-fetch departure anchors for a set of routes. Returns a Map keyed by
+   * routeId; routes with no anchor (e.g. simulation never ran, anchor expired)
+   * are simply omitted so callers can fall back to the wall-clock projection.
+   */
+  async getRouteDepartureAnchors(
+    routeIds: string[],
+  ): Promise<Map<string, number>> {
+    const map = new Map<string, number>();
+    await Promise.all(
+      routeIds.map(async (id) => {
+        const ts = await this.redisService.get<number>(
+          routeDepartureAnchorKey(id),
+        );
+        if (typeof ts === 'number' && Number.isFinite(ts)) {
+          map.set(id, ts);
+        }
+      }),
+    );
+    return map;
   }
 
   async getLivePositionsByRoute(routeId: string): Promise<LiveBusPosition[]> {
