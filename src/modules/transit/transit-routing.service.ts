@@ -6,7 +6,7 @@
 /* eslint-disable @typescript-eslint/no-unsafe-call */
 /* eslint-disable @typescript-eslint/no-unsafe-argument */
 /* eslint-disable @typescript-eslint/no-unsafe-assignment */
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, ServiceUnavailableException } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
 import { BusRouteStop } from './entities/bus-route-stop.schema';
@@ -55,6 +55,7 @@ interface StopInfo {
 interface RouteInfo {
   code?: string | null;
   name?: string | null;
+  color?: string | null;
   headwayMinutes?: number | null;
   isLine?: boolean | null;
   /**
@@ -293,7 +294,6 @@ function getTotalRideMinutes(
 
 @Injectable()
 export class TransitRoutingService {
-  private readonly logger = new Logger(TransitRoutingService.name);
 
   private networkCache: {
     stopInfoMap: Map<string, StopInfo>;
@@ -370,11 +370,7 @@ export class TransitRoutingService {
     // tens of seconds on a real-sized network). The promise is coalesced
     // through `networkLoadInFlight`, so even if multiple invalidations or
     // plan requests pile up concurrently, only one rebuild runs.
-    void this.getNetwork().catch((err: unknown) =>
-      this.logger.warn(
-        `Background network warm-up failed: ${(err as Error).message}`,
-      ),
-    );
+    void this.getNetwork().catch(() => {});
   }
 
   /**
@@ -430,14 +426,11 @@ export class TransitRoutingService {
     return map;
   }
 
-  // FIX #1: Coordinate Order Verification
-  // Valhalla requires [longitude, latitude]. If values exceed normal ranges, log an error.
-  private assertCoords(c: Coords, label: string) {
-    if (Math.abs(c[0]) > 180 || Math.abs(c[1]) > 90) {
-      this.logger.error(
-        `${label}: suspicious coords [${c}] — may be lat/lng swapped. Valhalla expects [longitude, latitude].`,
-      );
-    }
+  // Coordinate Order Verification stub — historically logged a warning when
+  // callers accidentally passed [lat, lng]. Kept as a no-op so callsites can
+  // continue to declare their coordinate expectations at request boundaries.
+  private assertCoords(_c: Coords, _label: string) {
+    /* no-op */
   }
 
   private async getNetwork() {
@@ -509,14 +502,6 @@ export class TransitRoutingService {
     const { stopRoutes } = this.buildStopRouteIndex(routeStopsMap);
     const footpaths = await this.buildFootpaths(stopInfoMap, stopRoutes);
 
-    // Sanity-check route headways against actual fleet size. Only runs on a
-    // full rebuild (the cold path) — warm Redis reads don't re-validate, so
-    // logs don't flood every plan request. Fire-and-forget because logging
-    // mustn't block the first request after invalidation.
-    void this.validateHeadways(routeInfoMap).catch((err: unknown) =>
-      this.logger.warn(`Headway validation failed: ${(err as Error).message}`),
-    );
-
     return {
       stopInfoMap,
       routeInfoMap,
@@ -525,63 +510,6 @@ export class TransitRoutingService {
       footpaths,
       validStopsCount,
     };
-  }
-
-  /**
-   * Emit warnings for routes whose configured headway is missing or appears
-   * inconsistent with the running fleet. Pure observability: detects ETA
-   * bugs that would otherwise be silent — when a route falls back to the
-   * hard-coded default of 30 minutes inside `pickBoardTime`, or when an
-   * operator adds buses without updating `headwayMinutes`.
-   *
-   * Definitions:
-   *   loopDuration   = ride time from stop 0 to the last stop on the first
-   *                    lap (already includes dwell, see `segTime`).
-   *   activeBusCount = number of `in-progress` trips for the route.
-   *   expectedHw     = loopDuration / activeBusCount, the headway implied
-   *                    by evenly-spaced buses on the loop.
-   *
-   * Warns when configured headway is null/undefined, OR when the configured
-   * value differs from the implied value by more than 50% AND there is at
-   * least one bus running (zero-bus routes have undefined headway by nature).
-   */
-  private async validateHeadways(
-    routeInfoMap: Map<string, RouteInfo>,
-  ): Promise<void> {
-    const counts = await this.busTripModel.aggregate<{
-      _id: Types.ObjectId;
-      count: number;
-    }>([
-      { $match: { status: 'in-progress' } },
-      { $group: { _id: '$route', count: { $sum: 1 } } },
-    ]);
-    const busesByRoute = new Map<string, number>();
-    for (const row of counts) busesByRoute.set(String(row._id), row.count);
-
-    for (const [routeId, info] of routeInfoMap) {
-      const label = info.code ?? info.name ?? routeId;
-      if (info.headwayMinutes == null) {
-        this.logger.warn(
-          `Headway sanity: route "${label}" has no headwayMinutes — pickBoardTime will fall back to the default 30 min projection.`,
-        );
-        continue;
-      }
-      const activeBuses = busesByRoute.get(routeId) ?? 0;
-      if (activeBuses === 0) continue;
-
-      const prefix = info.ridePrefixMinutes;
-      const lastIdx = (info.originalStopCount ?? 0) - 1;
-      if (!prefix || lastIdx <= 0) continue;
-      const loopDuration = prefix[lastIdx];
-      const expectedHw = loopDuration / activeBuses;
-      const drift = Math.abs(info.headwayMinutes - expectedHw);
-      if (drift / info.headwayMinutes > 0.5) {
-        this.logger.warn(
-          `Headway sanity: route "${label}" configured ${info.headwayMinutes.toFixed(1)} min but fleet implies ~${expectedHw.toFixed(1)} min ` +
-            `(loop=${loopDuration.toFixed(1)} min, ${activeBuses} active bus${activeBuses === 1 ? '' : 'es'}).`,
-        );
-      }
-    }
   }
 
   /**
@@ -615,10 +543,7 @@ export class TransitRoutingService {
         footpaths: new Map(raw.footpaths),
         validStopsCount: raw.validStopsCount,
       };
-    } catch (err) {
-      this.logger.warn(
-        `Network cache deserialise failed — rebuilding: ${(err as Error).message}`,
-      );
+    } catch {
       return null;
     }
   }
@@ -776,7 +701,7 @@ export class TransitRoutingService {
     const rawStops = await this.busRouteStopModel
       .find()
       .populate('stop', 'name location')
-      .populate('route', 'code name status headwayMinutes isLine')
+      .populate('route', 'code name color status headwayMinutes isLine')
       .sort({ route: 1, stopOrder: 1 })
       .lean()
       .exec();
@@ -808,6 +733,7 @@ export class TransitRoutingService {
         routeInfoMap.set(routeId, {
           code: route.code,
           name: route.name,
+          color: route.color ?? null,
           headwayMinutes: route.headwayMinutes ?? null,
           isLine: route.isLine ?? true,
         });
@@ -946,9 +872,6 @@ export class TransitRoutingService {
     // the union of their candidate targets — fewer HTTP round-trips than
     // one-source-per-call without sending an N×N matrix.
     const sourceIds = [...candidatesBySource.keys()];
-    const t0 = Date.now();
-    let valhallaCells = 0;
-    let valhallaHits = 0;
 
     for (
       let batchStart = 0;
@@ -987,7 +910,6 @@ export class TransitRoutingService {
         for (const { toStopId, distMeters } of candidates) {
           const tIdx = targetIndex.get(toStopId);
           if (tIdx === undefined) continue;
-          valhallaCells++;
           const cell = matrix[i]?.[tIdx];
           // Fall back to haversine + constant walk speed when Valhalla can't
           // route between a pair (e.g. unmapped path). Keeps the footpath
@@ -996,7 +918,6 @@ export class TransitRoutingService {
             cell?.durationSeconds != null
               ? cell.durationSeconds / 60
               : walkMinutes(distMeters, WALK_SPEED_KMH);
-          if (cell?.durationSeconds != null) valhallaHits++;
           if (!footpaths.has(fromId)) footpaths.set(fromId, []);
           footpaths.get(fromId)!.push({
             toStopId,
@@ -1006,11 +927,6 @@ export class TransitRoutingService {
         }
       }
     }
-
-    this.logger.log(
-      `Built footpaths: ${valhallaHits}/${valhallaCells} via Valhalla (` +
-        `${footpaths.size} stops, ${Date.now() - t0} ms)`,
-    );
 
     return footpaths;
   }
@@ -1201,14 +1117,6 @@ export class TransitRoutingService {
       }
 
       const newlyImproved = new Set<string>();
-      // Counters surfaced via debug log at end of round so a missing transfer
-      // chain can be diagnosed without re-instrumenting the code each time.
-      let transitStdCount = 0;
-      let transitSecondaryCount = 0;
-      let footpathStdCount = 0;
-      let footpathRelaxedCount = 0;
-      let footpathAttempted = 0;
-      let footpathSkippedRadius = 0;
 
       for (const [routeId, startIndex] of routesToScan) {
         const stops = routeStopsMap.get(routeId) ?? [];
@@ -1283,7 +1191,6 @@ export class TransitRoutingService {
                 hasLiveEta: boardHasLiveEta,
               });
               newlyImproved.add(current.stopId);
-              transitStdCount++;
 
               const destWalk = destSeeds.get(current.stopId);
               if (
@@ -1312,7 +1219,6 @@ export class TransitRoutingService {
                   fromStopId: boardedAtStopId,
                   hasLiveEta: boardHasLiveEta,
                 });
-                transitSecondaryCount++;
                 bestKnownTotal = arrivalOnBus + destWalk;
               }
             }
@@ -1325,11 +1231,7 @@ export class TransitRoutingService {
       for (const stopId of newlyImproved) {
         const baseArrival = tau[round].get(stopId) ?? Infinity;
         for (const fp of footpaths.get(stopId) ?? []) {
-          footpathAttempted++;
-          if (fp.distMeters > roundTransferRadius) {
-            footpathSkippedRadius++;
-            continue;
-          }
+          if (fp.distMeters > roundTransferRadius) continue;
           const arrivalAtTo =
             baseArrival + fp.walkMinutes + TRANSFER_PENALTY_MIN;
           const currentTauStar = tauStar.get(fp.toStopId) ?? Infinity;
@@ -1348,9 +1250,6 @@ export class TransitRoutingService {
             if (improves) {
               tau[round].set(fp.toStopId, arrivalAtTo);
               tauStar.set(fp.toStopId, arrivalAtTo);
-              footpathStdCount++;
-            } else {
-              footpathRelaxedCount++;
             }
             // Always write the walk label so reconstruction has the chain.
             // For relaxed cases, tauStar stays at its better value but the
@@ -1373,13 +1272,6 @@ export class TransitRoutingService {
           }
         }
       }
-
-      this.logger.debug(
-        `[round=${round}] transit: ${transitStdCount} std + ${transitSecondaryCount} secondary | ` +
-          `footpaths: ${footpathStdCount} std + ${footpathRelaxedCount} relaxed ` +
-          `(of ${footpathAttempted} attempted, ${footpathSkippedRadius} beyond radius) | ` +
-          `bestKnownTotal=${bestKnownTotal.toFixed(1)}m`,
-      );
 
       if (newlyImproved.size === 0 && footpathImprovements.size === 0) break;
       markedStops = new Set([...newlyImproved, ...footpathImprovements]);
@@ -1489,6 +1381,7 @@ export class TransitRoutingService {
         id: routeId,
         code: routeInfoMap.get(routeId)?.code ?? null,
         name: routeInfoMap.get(routeId)?.name ?? null,
+        color: routeInfoMap.get(routeId)?.color ?? null,
       },
       boardAt: {
         stopId: boardedAtStopId,
@@ -1664,66 +1557,6 @@ export class TransitRoutingService {
     // the destSeeds walk-to-destination (or EXCLUDED if Valhalla put it
     // outside the bestDur+10 window). Use this to figure out why a stop you
     // expected to alight at isn't a candidate.
-    const allTransitReached: string[] = [];
-    for (const [sid, lbl] of roundLabels) {
-      if (lbl.type !== 'transit') continue;
-      const arrive = tau[round].get(sid);
-      const walk = destSeeds.get(sid);
-      const name = stopInfoMap.get(sid)?.name ?? sid;
-      const walkStr = walk === undefined ? 'EXCLUDED' : `${walk.toFixed(1)}m`;
-      const arriveStr = arrive !== undefined ? arrive.toFixed(1) : '-';
-      allTransitReached.push(`${name}(arrive=${arriveStr}, walk=${walkStr})`);
-    }
-    this.logger.debug(
-      `[round=${round}] all bus-reached stops: ${allTransitReached.join(' | ')}`,
-    );
-
-    // Diagnostic: log the top alight candidates with their breakdown so you
-    // can see which transfer point won and why (arrival time vs. final walk).
-    // Trace the label chain on the winner to surface the actual transfer stop.
-    if (candidates.length > 0) {
-      const top = candidates.slice(0, 5).map((c) => {
-        const name = stopInfoMap.get(c.stopId)?.name ?? c.stopId;
-        const arrival = (tau[round].get(c.stopId) ?? Infinity).toFixed(1);
-        return `${name} total=${c.total.toFixed(1)}m (arrive=${arrival}m, walk=${c.walkMinutes.toFixed(1)}m, ride=${c.rideMinutes.toFixed(1)}m)`;
-      });
-      this.logger.debug(
-        `[round=${round}] top alight candidates: ${top.join(' | ')}`,
-      );
-
-      // Walk backwards through the labels for the winner to expose the chosen
-      // boarding/transfer stops — this is what actually drove the plan.
-      const trace: string[] = [];
-      let curStop = candidates[0].stopId;
-      let curRound = round;
-      const seen = new Set<string>();
-      while (curRound >= 0 && !seen.has(`${curRound}:${curStop}`)) {
-        seen.add(`${curRound}:${curStop}`);
-        const lbl = labels[curRound].get(curStop);
-        if (!lbl) break;
-        const here = stopInfoMap.get(curStop)?.name ?? curStop;
-        if (lbl.type === 'transit') {
-          const from =
-            stopInfoMap.get(lbl.boardedAtStopId)?.name ?? lbl.boardedAtStopId;
-          trace.push(
-            `bus ${routeInfoMap.get(lbl.routeId)?.code ?? lbl.routeId}: ${from} → ${here} (board@${lbl.boardTime.toFixed(1)}m)`,
-          );
-          curStop = lbl.boardedAtStopId;
-          curRound -= 1;
-        } else if (lbl.fromStopId === '__ORIGIN__') {
-          trace.push(`walk: origin → ${here}`);
-          break;
-        } else {
-          const from = stopInfoMap.get(lbl.fromStopId)?.name ?? lbl.fromStopId;
-          trace.push(`walk: ${from} → ${here} (${lbl.distMeters.toFixed(0)}m)`);
-          curStop = lbl.fromStopId;
-        }
-      }
-      this.logger.debug(
-        `[round=${round}] winner trace: ${trace.reverse().join(' → ')}`,
-      );
-    }
-
     const seenJourneyKey = new Set<string>();
     const dedupedOptions: RawOption[] = [];
 
@@ -2338,6 +2171,7 @@ export class TransitRoutingService {
           id: leg.routeId,
           code: routeInfo?.code ?? null,
           name: routeInfo?.name ?? null,
+          color: routeInfo?.color ?? null,
         },
         boardAt: {
           stopId: leg.boardStopId,
@@ -2415,16 +2249,23 @@ export class TransitRoutingService {
     this.assertCoords(origin, 'planWalkRoute: origin');
     this.assertCoords(destination, 'planWalkRoute: destination');
 
-    const directWalkDist = haversineMeters(origin, destination);
+    // Valhalla is required here — the fallback (straight-line haversine)
+    // draws a path through buildings/rivers, which is worse than a clean
+    // error. Throw so the frontend can show a proper outage state instead
+    // of a broken map.
     const valhallaResult = await this.valhallaService.getWalkPath(
       origin,
       destination,
     );
-    const path: Coords[] = valhallaResult?.path ?? [origin, destination];
-    const distanceMeters = valhallaResult?.distanceMeters ?? directWalkDist;
-    const estimatedMinutes = valhallaResult
-      ? Math.round(valhallaResult.durationSeconds / 60) || 1
-      : Math.round(walkMinutes(directWalkDist, WALK_SPEED_KMH));
+    if (!valhallaResult) {
+      throw new ServiceUnavailableException(
+        'Walking route unavailable — routing engine did not respond.',
+      );
+    }
+
+    const distanceMeters = valhallaResult.distanceMeters;
+    const estimatedMinutes =
+      Math.round(valhallaResult.durationSeconds / 60) || 1;
 
     return {
       found: true,
@@ -2442,7 +2283,7 @@ export class TransitRoutingService {
               type: 'walk',
               from: { name: 'Your Location', coordinates: origin },
               to: { name: 'Destination', coordinates: destination },
-              path,
+              path: valhallaResult.path,
               distanceMeters: Math.round(distanceMeters),
               estimatedMinutes,
             },
@@ -2456,11 +2297,20 @@ export class TransitRoutingService {
     this.assertCoords(origin, 'planTransitRoute: origin');
     this.assertCoords(destination, 'planTransitRoute: destination');
 
-    const network = await this.getNetwork();
-    if (network.validStopsCount === 0 || network.routeStopsMap.size === 0) {
-      this.logger.warn(
-        '[planTransitRoute] No stops in network, cannot find transit route',
+    // Distinguish "network can't load" (Mongo/Redis outage) from "no stops
+    // seeded" (a data-state condition the frontend should treat as an empty
+    // result). getNetwork throws when its DB / Valhalla footpath build fails;
+    // rethrow as 503 so the client sees a clear service-availability error
+    // instead of the "no route found" empty payload.
+    let network;
+    try {
+      network = await this.getNetwork();
+    } catch {
+      throw new ServiceUnavailableException(
+        'Transit network temporarily unavailable — try again shortly.',
       );
+    }
+    if (network.validStopsCount === 0 || network.routeStopsMap.size === 0) {
       return { found: false as const, type: 'transit' as const, options: [] };
     }
 
@@ -2490,9 +2340,6 @@ export class TransitRoutingService {
       'destination',
     );
     if (destSeeds.size === 0) {
-      this.logger.warn(
-        '[planTransitRoute] No destination stops reachable via Valhalla',
-      );
       return { found: false as const, type: 'transit' as const, options: [] };
     }
 
@@ -2518,9 +2365,6 @@ export class TransitRoutingService {
 
     for (let attempt = 0; attempt < ORIGIN_RADII_M.length; attempt++) {
       const radiusM = ORIGIN_RADII_M[attempt];
-      this.logger.debug(
-        `[planTransitRoute] attempt=${attempt + 1}/${ORIGIN_RADII_M.length} radius=${radiusM}m`,
-      );
 
       const originSeeds = await this.resolveAccessStop(
         origin,
@@ -2530,22 +2374,12 @@ export class TransitRoutingService {
         'origin',
       );
 
-      if (originSeeds.size === 0) {
-        this.logger.debug(
-          `[planTransitRoute] attempt=${attempt + 1} originSeeds=0 — expanding radius`,
-        );
-        continue;
-      }
+      if (originSeeds.size === 0) continue;
 
       // Monotonicity stop: same-or-smaller seed set than the previous attempt
       // means this iteration is redundant. `ORIGIN_RADII_M` is monotonic so
       // size cannot shrink; equality means no new stops are reachable.
-      if (prevSeedSize > 0 && originSeeds.size <= prevSeedSize) {
-        this.logger.debug(
-          `[planTransitRoute] attempt=${attempt + 1} radius=${radiusM}m — seed set didn't grow (${originSeeds.size} stops); stopping expansion.`,
-        );
-        break;
-      }
+      if (prevSeedSize > 0 && originSeeds.size <= prevSeedSize) break;
       prevSeedSize = originSeeds.size;
 
       const { tau, labels } = this.runRaptor(
@@ -2582,12 +2416,7 @@ export class TransitRoutingService {
         rawOptions.push(...opts);
       }
 
-      if (rawOptions.length === 0) {
-        this.logger.debug(
-          `[planTransitRoute] attempt=${attempt + 1} rawOptions=0 — expanding radius`,
-        );
-        continue;
-      }
+      if (rawOptions.length === 0) continue;
 
       this.recheckBusCatchability(rawOptions);
 
@@ -2600,16 +2429,8 @@ export class TransitRoutingService {
         })
         .filter((o) => o.segments.some((s) => s.type === 'bus'));
 
-      if (finalOptions.length === 0) {
-        this.logger.debug(
-          `[planTransitRoute] attempt=${attempt + 1} no valid bus options after filter — expanding radius`,
-        );
-        continue;
-      }
+      if (finalOptions.length === 0) continue;
 
-      this.logger.debug(
-        `[planTransitRoute] found ${finalOptions.length} option(s) at attempt=${attempt + 1} radius=${radiusM}m`,
-      );
       lastResult = finalOptions;
 
       // Quality check: stop expanding once we have at least one option that
@@ -2630,13 +2451,7 @@ export class TransitRoutingService {
         return total > 0 && wait / total > 0.5;
       });
 
-      if (!(allNeedManyTransfers || allHaveHighWait)) {
-        break;
-      }
-      this.logger.debug(
-        `[planTransitRoute] attempt=${attempt + 1} options present but all signal-bad ` +
-          `(manyTransfers=${allNeedManyTransfers}, highWait=${allHaveHighWait}) — expanding radius`,
-      );
+      if (!(allNeedManyTransfers || allHaveHighWait)) break;
     }
 
     if (lastResult) {
@@ -2655,9 +2470,6 @@ export class TransitRoutingService {
     // All radii exhausted — no transit route reachable. Return found:false so
     // the frontend can handle this case (e.g. show "no nearby stops" message).
     // Never return a walk plan here: the user explicitly requested transit.
-    this.logger.warn(
-      `[planTransitRoute] All ${ORIGIN_RADII_M.length} radius attempts exhausted — no transit route found`,
-    );
     return { found: false as const, type: 'transit' as const, options: [] };
   }
 }

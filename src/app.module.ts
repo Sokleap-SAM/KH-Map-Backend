@@ -17,6 +17,7 @@ import { UsersModule } from './modules/users/user.module';
 import { SearchHistoryModule } from './modules/search-history/search-history.module';
 import { AppSettingsModule } from './modules/app-settings/app-settings.module';
 import { MqttAuthModule } from './modules/mqtt-auth/mqtt-auth.module';
+import { FavoritesModule } from './modules/favorites/favorites.module';
 
 @Module({
   imports: [

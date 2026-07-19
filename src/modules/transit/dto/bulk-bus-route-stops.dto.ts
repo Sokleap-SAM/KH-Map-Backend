@@ -3,6 +3,7 @@ import {
   ArrayMinSize,
   IsArray,
   IsBoolean,
+  IsIn,
   IsMongoId,
   IsOptional,
   IsString,
@@ -20,17 +21,27 @@ export class BulkRouteStopItemDto {
   placeId!: string;
 
   /**
-   * Polyline coordinates from the PREVIOUS stop to this one, drawn manually
-   * on the frontend. Each entry is `[longitude, latitude]`. The first vertex
-   * should match the previous stop's coords; the last vertex should match
-   * this stop's coords.
+   * Polyline coordinates from the PREVIOUS stop to this one, stored
+   * verbatim — send `/admin/suggest-path` output after admin approval.
+   * Each entry is `[longitude, latitude]`. Must NOT include the raw stop
+   * coordinates: stops sit on the sidewalk, the path lives on the road.
    *
-   * Required for every stop after the first; the service rejects requests
-   * that omit it on stopOrder >= 2 or include it on stopOrder = 1.
+   * OPTIONAL for stops after the first — when omitted the backend computes
+   * the road path itself via Valhalla (optionally steered by `vias`).
+   * Must be absent on the first stop of a new route (no incoming segment).
    */
   @IsOptional()
   @IsArray()
   segmentFromPrevious?: [number, number][];
+
+  /**
+   * Optional steering points for the backend's Valhalla call — the segment
+   * is forced through each via, road-snapped. Ignored when
+   * `segmentFromPrevious` is provided.
+   */
+  @IsOptional()
+  @IsArray()
+  vias?: [number, number][];
 }
 
 export class BulkBusRouteStopsDto {
@@ -55,6 +66,11 @@ export class BulkBusRouteStopsDto {
   @IsOptional()
   @IsBoolean()
   isLine?: boolean;
+
+  @IsOptional()
+  @IsString()
+  @IsIn(['outbound', 'inbound'])
+  direction?: 'outbound' | 'inbound';
 
   // ─── The ordered list of stops to insert ───────────────────────────────────
 

@@ -13,6 +13,10 @@ import {
   FavoriteTransitRouteSchema,
 } from './entities/favorite-transit-route.schema';
 import { Place, PlaceSchema } from '../places/entities/place.schema';
+import {
+  PlaceCategory,
+  PlaceCategorySchema,
+} from '../places/entities/place-category.schema';
 import { TransitController } from './transit.controller';
 import { BusRouteService } from './bus-route.service';
 import { BusRouteStopService } from './bus-route-stop.service';
@@ -27,9 +31,12 @@ import { OsrmService } from './osrm.service';
 import { ValhallaService } from './valhalla.service';
 import { AppSettingsModule } from '../app-settings/app-settings.module';
 import { UsersModule } from '../users/user.module';
+import { PlaceModule } from '../places/place.module';
 import { DriverController } from './driver.controller';
 import { DriverService } from './driver.service';
 import { DriverLocationSubscriberService } from './driver-location-subscriber.service';
+import { AdminDashboardService } from './admin-dashboard.service';
+import { TransitSeedService } from './transit-seed.service';
 
 @Module({
   imports: [
@@ -41,9 +48,11 @@ import { DriverLocationSubscriberService } from './driver-location-subscriber.se
       { name: BusLocation.name, schema: BusLocationSchema },
       { name: FavoriteTransitRoute.name, schema: FavoriteTransitRouteSchema },
       { name: Place.name, schema: PlaceSchema },
+      { name: PlaceCategory.name, schema: PlaceCategorySchema },
     ]),
     AppSettingsModule,
     UsersModule,
+    PlaceModule,
   ],
   controllers: [TransitController, DriverController],
   providers: [
@@ -60,6 +69,8 @@ import { DriverLocationSubscriberService } from './driver-location-subscriber.se
     ValhallaService,
     DriverService,
     DriverLocationSubscriberService,
+    AdminDashboardService,
+    TransitSeedService,
   ],
   exports: [
     BusRouteService,

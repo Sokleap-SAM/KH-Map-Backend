@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
 import { BusRoute, BusRouteDocument } from './entities/bus-route.schema';
@@ -33,7 +33,6 @@ import { TransitMode } from '../app-settings/enums/transit-mode.enum';
  */
 @Injectable()
 export class BusDispatchService {
-  private readonly logger = new Logger(BusDispatchService.name);
 
   constructor(
     @InjectModel(BusRoute.name)
@@ -77,10 +76,6 @@ export class BusDispatchService {
     // Also clear the BusTripService's shared geo set.
     await this.redisService.del('bus:locations');
 
-    this.logger.warn(
-      `Fleet reset: deleted ${trips.deletedCount} trips, ${buses.deletedCount} buses, ${busLocations.deletedCount} bus_locations from Mongo and ${redisDeleted} Redis keys`,
-    );
-
     return {
       mongoDeleted: {
         trips: trips.deletedCount ?? 0,
@@ -110,9 +105,6 @@ export class BusDispatchService {
     await this.redisService.deleteByPattern('route:lastDeparture:*');
     await this.redisService.del('bus:locations');
 
-    this.logger.warn(
-      `Mode flip to live: cancelled ${result.modifiedCount} active trips and cleared sim Redis state`,
-    );
     return { cancelled: result.modifiedCount ?? 0 };
   }
 
@@ -134,10 +126,8 @@ export class BusDispatchService {
     for (const route of routes) {
       try {
         await this.dispatchForRoute(route);
-      } catch (err) {
-        this.logger.warn(
-          `Dispatch failed for route ${String(route._id)}: ${(err as Error).message}`,
-        );
+      } catch {
+        /* swallow */
       }
     }
   }
@@ -174,13 +164,6 @@ export class BusDispatchService {
         bus: new Types.ObjectId(busId),
         status: 'scheduled',
       });
-      this.logger.log(
-        `Trip ${tripId} completed — re-queued bus ${busId} as scheduled on route ${routeId}`,
-      );
-    } else {
-      this.logger.log(
-        `Trip ${tripId} completed — bus ${busId} idle (another bus already scheduled on route ${routeId})`,
-      );
     }
   }
 
@@ -252,71 +235,8 @@ export class BusDispatchService {
         routeId,
         Date.now(),
       );
-      this.logger.log(
-        `Promoted trip ${String(next._id)} to in-progress on route ${route.code ?? routeId}`,
-      );
     }
 
-    // Maintain the "exactly one scheduled" invariant. Re-read because the
-    // promotion above may have just consumed the only scheduled trip.
-    // const stillScheduled = await this.busTripModel.countDocuments({
-    //   route: route._id,
-    //   status: 'scheduled',
-    // });
-
-    // if (stillScheduled === 0) {
-    //   // Prevent races where multiple dispatch ticks concurrently try to
-    //   // create the single scheduled slot. Use Redis `SETNX` as a cheap
-    //   // per-route guard so only one process mints a new scheduled trip.
-    //   const scheduledLockKey = `dispatch:route:${routeId}:scheduled-lock`;
-    //   const acquired = await this.redisService.setnx(scheduledLockKey, '1', 60);
-    //   if (!acquired) {
-    //     this.logger.log(
-    //       `Another dispatcher already queued a scheduled trip for route ${route.code ?? routeId}`,
-    //     );
-    //     return;
-    //   }
-
-    //   try {
-    //     const idleBusId = await this.findIdleBusForRoute(route._id);
-    //     if (idleBusId) {
-    //       await this.busTripModel.create({
-    //         route: route._id,
-    //         bus: idleBusId,
-    //         status: 'scheduled',
-    //       });
-    //       this.logger.log(
-    //         `Re-queued idle bus ${String(idleBusId)} on route ${route.code ?? routeId}`,
-    //       );
-    //     } else {
-    //       const bus = await this.createNewBus(route);
-    //       try {
-    //         await this.busTripModel.create({
-    //           route: route._id,
-    //           bus: bus._id,
-    //           status: 'scheduled',
-    //         });
-    //         this.logger.log(
-    //           `Added new bus ${bus.busNumber} to queue on route ${route.code ?? routeId}`,
-    //         );
-    //       } catch (err) {
-    //         // If creating the scheduled trip conflicted (rare race), remove
-    //         // the orphaned bus we just created to avoid steady leakage.
-    //         const e = err as { code?: number };
-    //         if (e?.code === 11000) {
-    //           await this.busModel.deleteOne({ _id: bus._id }).exec();
-    //           this.logger.warn(
-    //             `Scheduled-trip creation conflicted; removed orphaned bus ${bus.busNumber}`,
-    //           );
-    //         } else {
-    //           throw err;
-    //         }
-    //       }
-    //     }
-    //   } finally {
-    //     await this.redisService.del(scheduledLockKey);
-    //   }
-    // }
     // Maintain the "exactly one scheduled" invariant.
     const stillScheduled = await this.busTripModel.countDocuments({
       route: route._id,
@@ -336,12 +256,7 @@ export class BusDispatchService {
     if (stillScheduled === 0) {
       const scheduledLockKey = `dispatch:route:${routeId}:scheduled-lock`;
       const acquired = await this.redisService.setnx(scheduledLockKey, '1', 60);
-      if (!acquired) {
-        this.logger.log(
-          `Another dispatcher already queued a scheduled trip for route ${route.code ?? routeId}`,
-        );
-        return;
-      }
+      if (!acquired) return;
 
       try {
         const idleBusId = await this.findIdleBusForRoute(route._id);
@@ -351,11 +266,8 @@ export class BusDispatchService {
             bus: idleBusId,
             status: 'scheduled',
           });
-          this.logger.log(
-            `Re-queued idle bus ${String(idleBusId)} on route ${route.code ?? routeId}`,
-          );
         } else if (totalActiveOnRoute < fleetCap) {
-          // FIX: ONLY mint a new physical bus if we haven't hit the route's steady-state capacity
+          // ONLY mint a new physical bus if we haven't hit the route's steady-state capacity
           const bus = await this.createNewBus(route);
           try {
             await this.busTripModel.create({
@@ -363,25 +275,14 @@ export class BusDispatchService {
               bus: bus._id,
               status: 'scheduled',
             });
-            this.logger.log(
-              `Added new bus ${bus.busNumber} to queue on route ${route.code ?? routeId}`,
-            );
           } catch (err) {
             const e = err as { code?: number };
             if (e?.code === 11000) {
               await this.busModel.deleteOne({ _id: bus._id }).exec();
-              this.logger.warn(
-                `Scheduled-trip creation conflicted; removed orphaned bus ${bus.busNumber}`,
-              );
             } else {
               throw err;
             }
           }
-        } else {
-          // The cap has been reached. We don't mint a new bus; we wait for an in-progress bus to finish.
-          this.logger.debug(
-            `Route ${route.code ?? routeId} is at fleet capacity (${totalActiveOnRoute}/${fleetCap}). Waiting for a trip to complete.`,
-          );
         }
       } finally {
         await this.redisService.del(scheduledLockKey);
@@ -469,10 +370,6 @@ export class BusDispatchService {
       String(route._id),
       Date.now(),
     );
-
-    this.logger.log(
-      `Bootstrapped route ${route.code ?? String(route._id)} with buses ${bus1.busNumber} (in-progress) and ${bus2.busNumber} (scheduled)`,
-    );
   }
 
   // ─── Bus creation ─────────────────────────────────────────────────────────
@@ -539,12 +436,7 @@ export class BusDispatchService {
         // Duplicate-key on busNumber or licensePlate — retry with the next
         // counter value. Surfaces as MongoServerError code 11000.
         const e = err as { code?: number; message?: string };
-        if (e?.code === 11000) {
-          this.logger.warn(
-            `createNewBus: duplicate "${busNumber}" on attempt ${attempt + 1}, retrying`,
-          );
-          continue;
-        }
+        if (e?.code === 11000) continue;
         throw err;
       }
     }

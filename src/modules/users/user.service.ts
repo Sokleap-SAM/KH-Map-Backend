@@ -196,6 +196,16 @@ export class UsersService {
     return this.userModel.findOne({ email }).exec();
   }
 
+  /**
+   * Count users by role, optionally narrowed by status (on/off shift).
+   * Used by the admin dashboard for at-a-glance fleet visibility.
+   */
+  async countByRole(role: UserRole, status?: UserStatus): Promise<number> {
+    const query: Record<string, unknown> = { role };
+    if (status) query.status = status;
+    return this.userModel.countDocuments(query).exec();
+  }
+
   async forgotPassword(email: string) {
     const user = await this.userModel.findOne({ email });
     if (!user)

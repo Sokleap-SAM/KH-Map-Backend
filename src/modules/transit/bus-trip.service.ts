@@ -368,10 +368,12 @@ export class BusTripService {
    * open so the card renders immediately, then keeps the value live by
    * recomputing locally from each MQTT position tick (same math).
    *
-   * Returns null if the trip has no live position in Redis (e.g. simulator
-   * just started, trip evicted). For scheduled (parked) buses the response
-   * carries `notDepartingUntilMs` so the client can render
-   * "Departs in N min" instead of "Arrives in N min".
+   * Throws `NotFoundException` when the trip has no live position in Redis
+   * (simulator hasn't seeded it yet, trip evicted, or trip doesn't exist)
+   * so the client can render an empty state or hide the ETA card without
+   * ambiguity. For scheduled (parked) buses the response carries
+   * `notDepartingUntilMs` so the client can render "Departs in N min"
+   * instead of "Arrives in N min".
    */
   async getEtaToNextStop(tripId: string): Promise<{
     tripId: string;
@@ -390,14 +392,22 @@ export class BusTripService {
     etaMinutes: number;
     notDepartingUntilMs?: number;
     isDwelling: boolean;
-  } | null> {
+  }> {
     const pos = await this.busLocationService.getLivePosition(tripId);
-    if (!pos) return null;
+    if (!pos) {
+      throw new NotFoundException(
+        `Trip ${tripId} has no live position yet.`,
+      );
+    }
 
     const stops = await this.busRouteStopService.findByRoute(
       new Types.ObjectId(pos.routeId),
     );
-    if (stops.length === 0) return null;
+    if (stops.length === 0) {
+      throw new NotFoundException(
+        `Trip ${tripId} route has no stops configured.`,
+      );
+    }
 
     const currentIdx = pos.currentStopIndex ?? 0;
     // Last stop reached → no next stop; client should label as "Arrived".

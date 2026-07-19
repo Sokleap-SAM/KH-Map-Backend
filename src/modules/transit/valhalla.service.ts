@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Coords } from '../../shared/helpers/helper-functions';
 
@@ -82,7 +82,6 @@ function decodePolyline6(encoded: string): Coords[] {
 
 @Injectable()
 export class ValhallaService {
-  private readonly logger = new Logger(ValhallaService.name);
   private readonly baseUrl: string;
 
   constructor(private readonly configService: ConfigService) {
@@ -128,10 +127,6 @@ export class ValhallaService {
       });
 
       if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        this.logger.warn(
-          `[getWalkPath] Valhalla ${res.status}: ${text.slice(0, 120)}`,
-        );
         return null;
       }
 
@@ -144,8 +139,7 @@ export class ValhallaService {
       const durationSeconds = leg.summary.time;
 
       return { path, distanceMeters, durationSeconds };
-    } catch (err) {
-      this.logger.warn(`[getWalkPath] fetch error: ${(err as Error).message}`);
+    } catch {
       return null;
     }
   }
@@ -154,14 +148,29 @@ export class ValhallaService {
 
   /**
    * Returns the road-snapped driving path between two coordinates using the
-   * `auto` costing model. Used by admin bulk-create flows to compute the
-   * polyline arriving at each bus stop from the previous one.
+   * `auto` costing model. Used by admin flows to compute the polyline
+   * arriving at each bus stop from the previous one.
+   *
+   * `vias` are optional intermediate points the path must pass through
+   * (Valhalla `through` locations). The admin drops them on the specific
+   * road the bus actually takes when the default (fastest) road is wrong —
+   * the result stays fully road-snapped either way.
+   *
+   * The returned shape starts/ends at the ROAD nearest each endpoint; the
+   * raw input coordinates (bus stops sit on the sidewalk) are never part
+   * of the path.
+   *
    * Coords format: [longitude, latitude] (GeoJSON order).
    */
-  async getAutoPath(from: Coords, to: Coords): Promise<WalkRouteResult | null> {
+  async getAutoPath(
+    from: Coords,
+    to: Coords,
+    vias: Coords[] = [],
+  ): Promise<WalkRouteResult | null> {
     const body = {
       locations: [
         { lon: from[0], lat: from[1], type: 'break' },
+        ...vias.map((v) => ({ lon: v[0], lat: v[1], type: 'through' })),
         { lon: to[0], lat: to[1], type: 'break' },
       ],
       costing: 'auto',
@@ -178,24 +187,29 @@ export class ValhallaService {
       });
 
       if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        this.logger.warn(
-          `[getAutoPath] Valhalla ${res.status}: ${text.slice(0, 120)}`,
-        );
         return null;
       }
 
       const data = (await res.json()) as ValhallaRouteResponse;
-      const leg = data.trip?.legs?.[0];
-      if (!leg) return null;
+      const legs = data.trip?.legs;
+      if (!legs || legs.length === 0) return null;
+
+      // `through` locations normally keep the trip to a single leg, but be
+      // defensive and concatenate if Valhalla splits it. Subsequent legs
+      // repeat the previous leg's last vertex as their first — skip it.
+      const path: Coords[] = [];
+      for (const leg of legs) {
+        const decoded = decodePolyline6(leg.shape);
+        path.push(...(path.length > 0 ? decoded.slice(1) : decoded));
+      }
+      if (path.length < 2) return null;
 
       return {
-        path: decodePolyline6(leg.shape),
-        distanceMeters: leg.summary.length * 1000,
-        durationSeconds: leg.summary.time,
+        path,
+        distanceMeters: data.trip.summary.length * 1000,
+        durationSeconds: data.trip.summary.time,
       };
-    } catch (err) {
-      this.logger.warn(`[getAutoPath] fetch error: ${(err as Error).message}`);
+    } catch {
       return null;
     }
   }
@@ -245,10 +259,6 @@ export class ValhallaService {
       });
 
       if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        this.logger.warn(
-          `[getWalkMatrixFull] Valhalla ${res.status}: ${text.slice(0, 120)}`,
-        );
         return sources.map(() => targets.map(() => null));
       }
 
@@ -263,10 +273,7 @@ export class ValhallaService {
           };
         }),
       );
-    } catch (err) {
-      this.logger.warn(
-        `[getWalkMatrixFull] fetch error: ${(err as Error).message}`,
-      );
+    } catch {
       return sources.map(() => targets.map(() => null));
     }
   }

@@ -1,13 +1,10 @@
 import {
   Inject,
   Injectable,
-  Logger,
   OnModuleDestroy,
   OnModuleInit,
 } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
 import type { IClientPublishOptions, MqttClient } from 'mqtt';
-import { MqttConfig } from '../../config/mqtt.config';
 
 export const MQTT_CLIENT = Symbol('MQTT_CLIENT');
 
@@ -19,40 +16,25 @@ interface Subscription {
 
 @Injectable()
 export class MqttService implements OnModuleInit, OnModuleDestroy {
-  private readonly logger = new Logger(MqttService.name);
   private client: MqttClient | null = null;
 
   // Registered subscriptions. Re-applied on reconnect so a broker bounce
   // doesn't silently leave the backend deaf to driver location publishes.
   private readonly subscriptions: Subscription[] = [];
 
-  constructor(
-    @Inject(MQTT_CLIENT) injectedClient: MqttClient,
-    private readonly configService: ConfigService,
-  ) {
+  constructor(@Inject(MQTT_CLIENT) injectedClient: MqttClient) {
     this.client = injectedClient;
   }
 
   onModuleInit(): void {
     if (!this.client) return;
     this.client.on('connect', () => {
-      const { url } = this.configService.get<MqttConfig>('mqtt')!;
-      this.logger.log(`Connected to MQTT broker at ${url}`);
       // Re-subscribe everything on every connect so a broker restart doesn't
       // strand handlers. mqtt.js drops server-side subs across sessions when
       // `clean: true`.
       for (const sub of this.subscriptions) {
-        this.client?.subscribe(sub.pattern, { qos: 0 }, (err) => {
-          if (err) {
-            this.logger.warn(
-              `MQTT re-subscribe to ${sub.pattern} failed: ${err.message}`,
-            );
-          }
-        });
+        this.client?.subscribe(sub.pattern, { qos: 0 });
       }
-    });
-    this.client.on('reconnect', () => {
-      this.logger.warn('Reconnecting to MQTT broker…');
     });
     // Dispatch incoming messages to every registered handler whose pattern
     // matches the inbound topic. mqtt.js doesn't expose its own pattern
@@ -63,25 +45,15 @@ export class MqttService implements OnModuleInit, OnModuleDestroy {
         if (topicMatches(sub.pattern, topic)) {
           try {
             sub.handler(topic, payload);
-          } catch (err) {
-            this.logger.warn(
-              `MQTT handler for ${sub.pattern} threw on topic ${topic}: ${(err as Error).message}`,
-            );
+          } catch {
+            /* swallow */
           }
         }
       }
     });
-    // Throttle error logs so a downed broker doesn't flood stdout. Reconnects
-    // emit errors continuously on every retry; one log per minute is enough
-    // to surface the problem without drowning out everything else.
-    let lastLogAt = 0;
-    this.client.on('error', (err: Error) => {
-      const now = Date.now();
-      if (now - lastLogAt > 60_000) {
-        lastLogAt = now;
-        this.logger.error(`MQTT error: ${err.message}`);
-      }
-    });
+    // A listener is required so reconnect errors aren't logged by Node as
+    // "Unhandled error event" and don't crash the process.
+    this.client.on('error', () => {});
   }
 
   /**
@@ -93,13 +65,7 @@ export class MqttService implements OnModuleInit, OnModuleDestroy {
   subscribe(pattern: string, handler: MqttMessageHandler): void {
     this.subscriptions.push({ pattern, handler });
     if (this.client && this.client.connected) {
-      this.client.subscribe(pattern, { qos: 0 }, (err) => {
-        if (err) {
-          this.logger.warn(
-            `MQTT subscribe to ${pattern} failed: ${err.message}`,
-          );
-        }
-      });
+      this.client.subscribe(pattern, { qos: 0 });
     }
   }
 
@@ -111,7 +77,6 @@ export class MqttService implements OnModuleInit, OnModuleDestroy {
       await new Promise<void>((resolve) =>
         this.client!.end(false, {}, () => resolve()),
       );
-      this.logger.log('MQTT client disconnected');
     }
   }
 
@@ -129,13 +94,7 @@ export class MqttService implements OnModuleInit, OnModuleDestroy {
     if (!this.client || !this.client.connected) return; // drop silently while disconnected
     const body =
       typeof payload === 'string' ? payload : JSON.stringify(payload);
-    this.client.publish(topic, body, options, (err) => {
-      if (err) {
-        this.logger.warn(
-          `MQTT publish to ${topic} failed: ${(err as Error).message}`,
-        );
-      }
-    });
+    this.client.publish(topic, body, options);
   }
 }
 
