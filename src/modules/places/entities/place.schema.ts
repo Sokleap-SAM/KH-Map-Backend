@@ -12,7 +12,10 @@ export type GeoJsonPoint = {
 @Schema({ timestamps: true, collection: 'places' })
 export class Place extends BaseEntity {
   @Prop({ required: true, type: String })
-  name: string;
+  nameInKhmer: string;
+
+  @Prop({ required: true, type: String })
+  nameInLatin: string;
 
   @Prop({ type: Types.ObjectId, ref: 'PlaceCategory', default: null })
   category: Types.ObjectId | null;

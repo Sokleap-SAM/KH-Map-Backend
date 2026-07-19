@@ -95,12 +95,12 @@ export class PlaceService {
 
   async findByCategory(
     categoryId: Types.ObjectId,
-  ): Promise<{ _id: Types.ObjectId; name: string }[]> {
+  ): Promise<{ _id: Types.ObjectId; nameInKhmer: string }[]> {
     return this.placeModel
       .find({ category: categoryId })
-      .select('_id name')
+      .select('_id nameInKhmer')
       .lean()
-      .exec() as Promise<{ _id: Types.ObjectId; name: string }[]>;
+      .exec() as Promise<{ _id: Types.ObjectId; nameInKhmer: string }[]>;
   }
 
   async findOne(id: Types.ObjectId): Promise<Place> {

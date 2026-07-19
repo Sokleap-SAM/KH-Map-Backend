@@ -700,7 +700,7 @@ export class TransitRoutingService {
   }> {
     const rawStops = await this.busRouteStopModel
       .find()
-      .populate('stop', 'name location')
+      .populate('stop', 'nameInKhmer location')
       .populate('route', 'code name color status headwayMinutes isLine')
       .sort({ route: 1, stopOrder: 1 })
       .lean()
@@ -726,7 +726,7 @@ export class TransitRoutingService {
 
       stopInfoMap.set(stopId, {
         coordinates: place.location.coordinates as Coords,
-        name: place.name,
+        name: place.nameInKhmer,
       });
 
       if (!routeInfoMap.has(routeId)) {

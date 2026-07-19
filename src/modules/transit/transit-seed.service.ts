@@ -123,7 +123,7 @@ export class TransitSeedService {
 
       const existing = await this.placeModel
         .findOne({
-          name,
+          nameInKhmer: name,
           category: busStopCategory._id,
           'location.coordinates': [lng, lat],
         })
@@ -134,7 +134,12 @@ export class TransitSeedService {
       }
 
       await this.placeModel.create({
-        name,
+        nameInKhmer: name,
+        // nameInLatin is required but the Khmer stops file carries no Latin
+        // name — seed the Khmer name as an interim placeholder; the
+        // backfill-place-name-latin script overwrites it with the real Latin
+        // name by matching coordinates against the English export.
+        nameInLatin: name,
         category: busStopCategory._id,
         location: { type: 'Point', coordinates: [lng, lat] },
       });
@@ -193,8 +198,8 @@ export class TransitSeedService {
     const dryRun = opts.dryRun ?? false;
 
     const testPlaces = await this.placeModel
-      .find({ name: TEST_NAME_PATTERN })
-      .select('_id name')
+      .find({ nameInKhmer: TEST_NAME_PATTERN })
+      .select('_id nameInKhmer')
       .exec();
     const testRoutes = await this.busRouteModel
       .find({ name: TEST_NAME_PATTERN })
@@ -203,7 +208,7 @@ export class TransitSeedService {
 
     const matchedPlaces = testPlaces.map((p) => ({
       _id: p._id.toString(),
-      name: p.name,
+      name: p.nameInKhmer,
     }));
     const matchedRoutes = testRoutes.map((r) => ({
       _id: r._id.toString(),

@@ -15,7 +15,11 @@ import { Types } from 'mongoose';
 export class CreatePlaceDto {
   @IsString()
   @IsNotEmpty()
-  name!: string;
+  nameInKhmer!: string;
+
+  @IsString()
+  @IsNotEmpty()
+  nameInLatin!: string;
 
   @IsOptional()
   @Transform(({ value }) =>

@@ -103,12 +103,14 @@ export class BusTripService {
 
     const nextStop =
       live && stops[live.nextStopIndex]
-        ? (stops[live.nextStopIndex].stop as any).name
+        ? (stops[live.nextStopIndex].stop as any).nameInKhmer
         : 'ស្វែងរកចំណត...';
 
     const destination = trip.route?.name || 'មិនច្បាស់លាស់';
 
-    const allStopNames = stops.map((s) => (s.stop as any)?.name || 'Unknown');
+    const allStopNames = stops.map(
+      (s) => (s.stop as any)?.nameInKhmer || 'Unknown',
+    );
 
     return {
       ...trip,
@@ -418,7 +420,7 @@ export class BusTripService {
       number,
       number,
     ];
-    const nextStopName = (nextStopDoc.stop as any).name as string;
+    const nextStopName = (nextStopDoc.stop as any).nameInKhmer as string;
     const nextStopId = (nextStopDoc.stop as any)._id.toString() as string;
 
     // Speed = 0 means the bus is dwelling or parked. Routing math falls

@@ -629,12 +629,12 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
 
       const nextStopRef = nextStop.stop as unknown as {
         _id?: { toString(): string };
-        name?: string;
+        nameInKhmer?: string;
       };
       let cumMin = nextEtaMin;
       upcoming.push({
         stopId: nextStopRef._id?.toString() ?? '',
-        name: nextStopRef.name ?? '',
+        name: nextStopRef.nameInKhmer ?? '',
         etaMinutes: etaNextStopMin,
       });
 
@@ -653,11 +653,11 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
           (segDist / 1000 / BUS_ROUTING_SPEED_KMH) * 60 + DWELL_TIME_MIN;
         const currRef = curr.stop as unknown as {
           _id?: { toString(): string };
-          name?: string;
+          nameInKhmer?: string;
         };
         upcoming.push({
           stopId: currRef._id?.toString() ?? '',
-          name: currRef.name ?? '',
+          name: currRef.nameInKhmer ?? '',
           etaMinutes: Math.max(0, Math.round(cumMin * 10) / 10),
         });
       }
