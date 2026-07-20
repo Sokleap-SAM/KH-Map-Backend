@@ -1,4 +1,4 @@
-import { IsNotEmpty, IsOptional, IsString } from 'class-validator';
+import { IsIn, IsNotEmpty, IsOptional, IsString } from 'class-validator';
 import { Transform } from 'class-transformer';
 import { Types } from 'mongoose';
 
@@ -13,5 +13,6 @@ export class CreateBusTripDto {
 
   @IsOptional()
   @IsString()
+  @IsIn(['scheduled', 'in-progress', 'completed', 'cancelled'])
   status?: string;
 }

@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-assignment */
 import {
+  IsIn,
   IsNumber,
   IsOptional,
   IsString,
@@ -19,6 +20,7 @@ class GeoJsonPointDto {
 export class UpdateBusTripDto {
   @IsOptional()
   @IsString()
+  @IsIn(['scheduled', 'in-progress', 'completed', 'cancelled'])
   status?: string;
 
   @IsOptional()

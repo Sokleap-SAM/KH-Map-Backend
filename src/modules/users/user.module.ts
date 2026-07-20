@@ -1,5 +1,6 @@
 import { MongooseModule } from '@nestjs/mongoose';
 import { User, UserSchema } from './entities/user.schema';
+import { Bus, BusSchema } from '../transit/entities/bus.schema';
 import { Module } from '@nestjs/common';
 import { UsersController } from './user.controller';
 import { UsersService } from './user.service';
@@ -12,9 +13,11 @@ import { MailerModule } from '@nestjs-modules/mailer';
 
 @Module({
   imports: [
-    MongooseModule.forFeature([{ name: User.name, schema: UserSchema }]),
+    MongooseModule.forFeature([
+      { name: User.name, schema: UserSchema },
+      { name: Bus.name, schema: BusSchema },
+    ]),
     PassportModule.register({ defaultStrategy: 'jwt' }),
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
     MailerModule.forRootAsync({
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
@@ -36,7 +39,7 @@ import { MailerModule } from '@nestjs-modules/mailer';
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
         secret: config.get<string>('JWT_SECRET') || 'SUPER_SECRET_KEY',
-        signOption: { expiresIn: '1d' },
+        signOptions: { expiresIn: '1d' },
       }),
     }),
   ],
