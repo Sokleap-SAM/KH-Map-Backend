@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   Injectable,
+  Logger,
   NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common';
@@ -46,6 +47,8 @@ const STITCH_CONNECTOR_DETOUR_FACTOR = 5;
 
 @Injectable()
 export class BusRouteStopService {
+  private readonly logger = new Logger(BusRouteStopService.name);
+
   constructor(
     @InjectModel(BusRouteStop.name)
     private readonly busRouteStopModel: Model<BusRouteStopDocument>,
@@ -256,10 +259,7 @@ export class BusRouteStopService {
     if (!existing)
       throw new NotFoundException(`BusRouteStop ${id.toString()} not found`);
 
-    if (
-      dto.stopOrder !== undefined &&
-      dto.stopOrder !== existing.stopOrder
-    ) {
+    if (dto.stopOrder !== undefined && dto.stopOrder !== existing.stopOrder) {
       throw new BadRequestException(
         'stopOrder cannot be changed via update — delete the stop and re-create it at the desired position.',
       );

@@ -33,7 +33,6 @@ import { TransitMode } from '../app-settings/enums/transit-mode.enum';
  */
 @Injectable()
 export class BusDispatchService {
-
   constructor(
     @InjectModel(BusRoute.name)
     private readonly busRouteModel: Model<BusRouteDocument>,
