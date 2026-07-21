@@ -32,7 +32,6 @@ import { SuggestPathDto } from './dto/suggest-path.dto';
 import { DashboardQueryDto } from './dto/dashboard-query.dto';
 import { ValhallaService } from './valhalla.service';
 import { AdminDashboardService } from './admin-dashboard.service';
-import { TransitSeedService } from './transit-seed.service';
 import { CreateBusDto } from './dto/create-bus.dto';
 import { UpdateBusDto } from './dto/update-bus.dto';
 import { CreateBusTripDto } from './dto/create-bus-trip.dto';
@@ -61,7 +60,6 @@ export class TransitController {
     private readonly appSettings: AppSettingsService,
     private readonly valhallaService: ValhallaService,
     private readonly adminDashboardService: AdminDashboardService,
-    private readonly transitSeedService: TransitSeedService,
   ) {}
 
   // ─── Admin: global transit mode ───────────────────────────────────────────
@@ -128,40 +126,6 @@ export class TransitController {
     }
   }
 
-  // ─── Admin: seed & cleanup ────────────────────────────────────────────────
-
-  /**
-   * Seed Places and BusRoutes from the GeoJSON files in src/data/.
-   * Idempotent — re-running skips docs that already exist.
-   *
-   * POST /transit/admin/seed
-   * Optional body: { linesPath?: string; stopsPath?: string }
-   */
-  @UseGuards(JwtAuthGuard, RolesGuard)
-  @Roles(UserRole.ADMIN)
-  @Post('admin/seed')
-  seedTransit(@Body() body: { linesPath?: string; stopsPath?: string } = {}) {
-    return this.transitSeedService.seedAll(body);
-  }
-
-  /**
-   * Delete Places + BusRoutes whose `name` starts with "Test"
-   * (word-bounded, case-sensitive). Cascade-removes any BusRouteStop
-   * referencing the deleted Places or Routes — they're a link table
-   * with no canonical data.
-   *
-   * POST /transit/admin/cleanup-test?dryRun=true   → preview only
-   * POST /transit/admin/cleanup-test               → delete
-   */
-  @UseGuards(JwtAuthGuard, RolesGuard)
-  @Roles(UserRole.ADMIN)
-  @Post('admin/cleanup-test')
-  cleanupTest(@Query('dryRun') dryRun?: string) {
-    return this.transitSeedService.cleanupTestData({
-      dryRun: dryRun === 'true' || dryRun === '1',
-    });
-  }
-
   // ─── Route Planning ────────────────────────────────────────
 
   /**
@@ -178,6 +142,7 @@ export class TransitController {
       [query.originLng, query.originLat],
       [query.destLng, query.destLat],
       query.type,
+      query.language,
     );
   }
 

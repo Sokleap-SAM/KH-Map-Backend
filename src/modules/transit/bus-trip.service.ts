@@ -102,9 +102,9 @@ export class BusTripService {
     const stops = await this.busRouteStopService.findByRoute(routeId);
 
     const nextStop =
-      live && stops[live.nextStopIndex]
-        ? (stops[live.nextStopIndex].stop as any).nameInKhmer
-        : 'ស្វែងរកចំណត...';
+      (live && stops[live.nextStopIndex]
+        ? (stops[live.nextStopIndex].stop as any)?.nameInKhmer
+        : null) ?? 'ស្វែងរកចំណត...';
 
     const destination = trip.route?.name || 'មិនច្បាស់លាស់';
 

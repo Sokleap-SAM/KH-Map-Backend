@@ -36,7 +36,6 @@ import { DriverController } from './driver.controller';
 import { DriverService } from './driver.service';
 import { DriverLocationSubscriberService } from './driver-location-subscriber.service';
 import { AdminDashboardService } from './admin-dashboard.service';
-import { TransitSeedService } from './transit-seed.service';
 
 @Module({
   imports: [
@@ -70,7 +69,6 @@ import { TransitSeedService } from './transit-seed.service';
     DriverService,
     DriverLocationSubscriberService,
     AdminDashboardService,
-    TransitSeedService,
   ],
   exports: [
     BusRouteService,

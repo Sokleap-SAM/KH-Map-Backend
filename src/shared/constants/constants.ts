@@ -122,7 +122,10 @@ export const ROUTE_DEPARTURE_ANCHOR_TTL_SECONDS = 24 * 60 * 60;
 export const NETWORK_CACHE_TTL_MS = 5 * 60 * 1000;
 
 /** Redis key for the persisted, pre-computed transit network snapshot. */
-export const NETWORK_CACHE_REDIS_KEY = 'transit:network:v1';
+// Bumped v1→v2 when StopInfo gained nameInKhmer/nameInLatin (was a single
+// `name`). The version suffix ensures a deploy doesn't rehydrate the old
+// snapshot shape, which would surface stops with undefined names until TTL.
+export const NETWORK_CACHE_REDIS_KEY = 'transit:network:v2';
 
 /**
  * TTL (seconds) for the Redis-backed network cache. Long because we invalidate

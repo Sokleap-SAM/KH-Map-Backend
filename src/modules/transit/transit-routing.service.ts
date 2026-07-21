@@ -1,6 +1,5 @@
 /* eslint-disable @typescript-eslint/no-unused-vars */
 /* eslint-disable @typescript-eslint/no-unsafe-return */
-/* eslint-disable @typescript-eslint/restrict-template-expressions */
 /* eslint-disable @typescript-eslint/no-unnecessary-type-assertion */
 /* eslint-disable @typescript-eslint/no-unsafe-member-access */
 /* eslint-disable @typescript-eslint/no-unsafe-call */
@@ -44,12 +43,17 @@ import {
   pointToSegmentDistance,
 } from '../../shared/helpers/helper-functions';
 import { ValhallaService } from './valhalla.service';
+import { Language } from './dto/plan-route.dto';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 interface StopInfo {
   coordinates: Coords;
-  name: string;
+  // Both language variants are cached so a single shared network snapshot can
+  // serve requests in either language — the response builder picks one via
+  // `stopName(info, language)`.
+  nameInKhmer: string;
+  nameInLatin: string;
 }
 
 interface RouteInfo {
@@ -139,6 +143,42 @@ type JourneyLabel =
     };
 
 // ─── Module-level helpers ─────────────────────────────────────────────────────
+
+// Fixed (non-DB) response strings, per language. Stop names come from the DB
+// (see `stopName`); everything here is UI text the backend generates itself.
+// Adjust the Khmer wording freely — it's isolated to this table.
+const UI_STRINGS = {
+  [Language.ENGLISH]: {
+    yourLocation: 'Your Location',
+    destination: 'Destination',
+    walking: 'Walking',
+    longWalkWarning: (meters: number) =>
+      `Long walking distance: ${meters}m total`,
+    significantWalkToFirstStop:
+      'Note: This route requires a significant walk to the first stop.',
+  },
+  [Language.KHMER]: {
+    yourLocation: 'ទីតាំងរបស់អ្នក',
+    destination: 'គោលដៅ',
+    walking: 'ការដើរ',
+    longWalkWarning: (meters: number) =>
+      `ចម្ងាយដើរឆ្ងាយ៖ សរុប ${meters} ម៉ែត្រ`,
+    significantWalkToFirstStop:
+      'ចំណាំ៖ ផ្លូវនេះត្រូវការការដើរច្រើនទៅកាន់ចំណតដំបូង។',
+  },
+} as const;
+
+// Fixed UI strings for a language, defaulting to Khmer (the historical
+// behaviour) for any unexpected/empty value.
+function ui(language: Language) {
+  return UI_STRINGS[language] ?? UI_STRINGS[Language.KHMER];
+}
+
+// Pick a stop's name in the requested language. English → Latin transliteration,
+// otherwise the Khmer name.
+function stopName(info: StopInfo, language: Language): string {
+  return language === Language.ENGLISH ? info.nameInLatin : info.nameInKhmer;
+}
 
 function onbusNodeId(routeId: string, stopId: string): string {
   return `onbus:${routeId}:${stopId}`;
@@ -294,7 +334,6 @@ function getTotalRideMinutes(
 
 @Injectable()
 export class TransitRoutingService {
-
   private networkCache: {
     stopInfoMap: Map<string, StopInfo>;
     routeInfoMap: Map<string, RouteInfo>;
@@ -387,9 +426,13 @@ export class TransitRoutingService {
     origin: Coords,
     destination: Coords,
     current: RawOption[],
+    language: Language,
   ): RawOption[] {
     const r = (n: number) => n.toFixed(3);
-    const key = `${r(origin[0])},${r(origin[1])}→${r(destination[0])},${r(destination[1])}`;
+    // Language is part of the key: cached options carry pre-localized segment
+    // names, so a Khmer entry must never be merged into an English response
+    // (or vice versa) for the same origin/destination.
+    const key = `${r(origin[0])},${r(origin[1])}→${r(destination[0])},${r(destination[1])}|${language}`;
     const now = Date.now();
     const cached = this.optionHysteresis.get(key);
 
@@ -700,7 +743,7 @@ export class TransitRoutingService {
   }> {
     const rawStops = await this.busRouteStopModel
       .find()
-      .populate('stop', 'nameInKhmer location')
+      .populate('stop', 'nameInKhmer nameInLatin location')
       .populate('route', 'code name color status headwayMinutes isLine')
       .sort({ route: 1, stopOrder: 1 })
       .lean()
@@ -711,7 +754,7 @@ export class TransitRoutingService {
         s.stop &&
         (s.stop as any).location?.coordinates &&
         s.route &&
-        (s.route as any).status !== 'inactive',
+        (s.route as any).status === 'active',
     );
 
     const stopInfoMap = new Map<string, StopInfo>();
@@ -726,7 +769,8 @@ export class TransitRoutingService {
 
       stopInfoMap.set(stopId, {
         coordinates: place.location.coordinates as Coords,
-        name: place.nameInKhmer,
+        nameInKhmer: place.nameInKhmer,
+        nameInLatin: place.nameInLatin,
       });
 
       if (!routeInfoMap.has(routeId)) {
@@ -1294,6 +1338,7 @@ export class TransitRoutingService {
     stopInfoMap: Map<string, StopInfo>,
     routeAnchors: Map<string, number>,
     nowMs: number,
+    language: Language,
   ): { [key: string]: unknown } | null {
     const routeStops = routeStopsMap.get(routeId) ?? [];
     const boardIdx = routeStops.findIndex((s) => s.stopId === boardedAtStopId);
@@ -1319,7 +1364,7 @@ export class TransitRoutingService {
     }> = [
       {
         stopId: boardedAtStopId,
-        name: boardStop.name,
+        name: stopName(boardStop, language),
         coordinates: boardStop.coordinates,
       },
     ];
@@ -1337,7 +1382,7 @@ export class TransitRoutingService {
       if (stopInfo) {
         stopSequence.push({
           stopId: curr.stopId,
-          name: stopInfo.name,
+          name: stopName(stopInfo, language),
           coordinates: stopInfo.coordinates,
         });
       }
@@ -1385,12 +1430,12 @@ export class TransitRoutingService {
       },
       boardAt: {
         stopId: boardedAtStopId,
-        name: boardStop.name,
+        name: stopName(boardStop, language),
         coordinates: boardStop.coordinates,
       },
       alightAt: {
         stopId: alightStopId,
-        name: alightStop.name,
+        name: stopName(alightStop, language),
         coordinates: alightStop.coordinates,
       },
       intermediateStops: stopSequence.slice(1, -1),
@@ -1428,6 +1473,7 @@ export class TransitRoutingService {
       string,
       { path: Coords[]; distanceMeters: number; durationSeconds: number } | null
     >,
+    language: Language,
     topK = 3,
   ): Promise<RawOption[]> {
     const roundLabels = labels[round];
@@ -1577,6 +1623,7 @@ export class TransitRoutingService {
         routeAnchors,
         nowMs,
         valhallaWalkCache,
+        language,
         candidate.altLabel,
       );
       if (option && !seenJourneyKey.has(option.fingerprint)) {
@@ -1606,6 +1653,7 @@ export class TransitRoutingService {
       string,
       { path: Coords[]; distanceMeters: number; durationSeconds: number } | null
     >,
+    language: Language,
     // Used for intermediate-alight candidates where the bus passes through
     // bestStopId but labels[round][bestStopId] doesn't reflect that bus leg
     // (a prior round set a better arrival via a different path). When present,
@@ -1663,10 +1711,50 @@ export class TransitRoutingService {
       if (!label) break;
 
       if (label.type === 'walk') {
-        if (label.fromStopId === '__ORIGIN__') {
-          const toStop = stopInfoMap.get(currentStopId);
-          if (!toStop) return null;
-          // Use real Valhalla path for origin → first stop walk
+        const toStop = stopInfoMap.get(currentStopId);
+        if (!toStop) return null;
+
+        // Resolve the whole contiguous run of footpath walk labels in this
+        // round up-front (by following fromStopId) BEFORE emitting anything.
+        //
+        // Why: two bus stops that share a name and sit a few dozen metres
+        // apart (common for a market with several platforms) can end up with
+        // footpath labels pointing at each other — labels[r][P1].from = P2 and
+        // labels[r][P2].from = P1. Following them one hop at a time emits a
+        // useless P1→P2→P1 "ping-pong" walk and, because the per-round visited
+        // guard at the top of this loop trips on the second visit, the loop
+        // breaks BEFORE it reaches the __ORIGIN__ label — so the real
+        // origin→first-stop walk is dropped entirely. Resolving the run first
+        // lets us distinguish a clean chain (ends at __ORIGIN__ or a bus
+        // alight) from a cyclic/dead-end one and collapse the latter to a
+        // single origin-access walk.
+        const runSeen = new Set<string>([currentStopId]);
+        let terminus = label.fromStopId; // '__ORIGIN__' | stopId
+        let cyclic = false;
+        for (;;) {
+          if (terminus === '__ORIGIN__') break;
+          if (runSeen.has(terminus)) {
+            cyclic = true;
+            break;
+          }
+          const next = labels[currentRound].get(terminus);
+          if (!next || next.type !== 'walk') break; // bus alight or dead-end
+          runSeen.add(terminus);
+          terminus = next.fromStopId;
+        }
+
+        const terminusLabel =
+          terminus === '__ORIGIN__'
+            ? undefined
+            : labels[currentRound].get(terminus);
+        const isTransferWalk = !cyclic && terminusLabel?.type === 'transit';
+
+        if (!isTransferWalk) {
+          // Origin-access walk: the run reaches __ORIGIN__, cycles between
+          // co-located stops, or dead-ends. In every case the rider simply
+          // walks from their origin to this stop — there is no earlier bus on
+          // this side of the journey. Emit one clean Valhalla walk and stop
+          // the back-trace (dropping any cyclic footpath waypoints).
           const walk = await getWalk(origin, toStop.coordinates);
           const distMeters =
             walk?.distanceMeters ?? haversineMeters(origin, toStop.coordinates);
@@ -1675,8 +1763,11 @@ export class TransitRoutingService {
             : Math.round(walkMinutes(distMeters, WALK_SPEED_KMH)) || 1;
           segmentsRev.push({
             type: 'walk',
-            from: { name: 'Your Location', coordinates: origin },
-            to: { name: toStop.name, coordinates: toStop.coordinates },
+            from: { name: ui(language).yourLocation, coordinates: origin },
+            to: {
+              name: stopName(toStop, language),
+              coordinates: toStop.coordinates,
+            },
             path: walk?.path ?? [origin, toStop.coordinates],
             distanceMeters: Math.round(distMeters),
             estimatedMinutes: estMinutes,
@@ -1685,10 +1776,11 @@ export class TransitRoutingService {
           break;
         }
 
-        const isActualTransfer = lastBusRouteId !== null;
-        const fromStop = stopInfoMap.get(label.fromStopId);
-        const toStop = stopInfoMap.get(currentStopId);
-        if (!fromStop || !toStop) return null;
+        // Transfer walk: bridge the previous bus's alight stop (terminus) to
+        // this stop in a single segment, skipping any intermediate footpath
+        // waypoints (they are RAPTOR internals, not user-meaningful).
+        const fromStop = stopInfoMap.get(terminus);
+        if (!fromStop) return null;
 
         // Use real Valhalla path for transfer walk between stops
         const walk = await getWalk(fromStop.coordinates, toStop.coordinates);
@@ -1701,20 +1793,25 @@ export class TransitRoutingService {
 
         segmentsRev.push({
           type: 'walk',
-          from: { name: fromStop.name, coordinates: fromStop.coordinates },
-          to: { name: toStop.name, coordinates: toStop.coordinates },
+          from: {
+            name: stopName(fromStop, language),
+            coordinates: fromStop.coordinates,
+          },
+          to: {
+            name: stopName(toStop, language),
+            coordinates: toStop.coordinates,
+          },
           path: walk?.path ?? [fromStop.coordinates, toStop.coordinates],
           distanceMeters: Math.round(distMeters),
           estimatedMinutes: estMinutes,
-          isTransfer: isActualTransfer,
+          isTransfer: true,
         });
 
-        currentStopId = label.fromStopId;
-        // ✅ FIX: Do NOT decrement currentRound here.
-        // Footpath walk labels are written into the SAME round as the transit
-        // leg that enabled them. Decrementing here skips the bus leg in that
-        // round entirely, causing the first leg (e.g. Route 2A) to disappear.
-        // Only the transit branch should decrement the round.
+        currentStopId = terminus;
+        // Do NOT decrement currentRound: footpath walk labels live in the same
+        // round as the transit leg that enabled them; the transit branch is the
+        // only place that decrements. Decrementing here would skip that bus leg
+        // and make the first leg (e.g. Route 2A) disappear.
         continue;
       }
 
@@ -1737,6 +1834,7 @@ export class TransitRoutingService {
         stopInfoMap,
         routeAnchors,
         nowMs,
+        language,
       );
       if (!busSegment) return null;
 
@@ -1773,10 +1871,10 @@ export class TransitRoutingService {
     segmentsRev.unshift({
       type: 'walk',
       from: {
-        name: destStop.name,
+        name: stopName(destStop, language),
         coordinates: destStop.coordinates,
       },
-      to: { name: 'Destination', coordinates: destination },
+      to: { name: ui(language).destination, coordinates: destination },
       path: destWalk?.path ?? [destStop.coordinates, destination],
       distanceMeters: Math.round(destDistMeters),
       estimatedMinutes: destEstMinutes,
@@ -1893,15 +1991,14 @@ export class TransitRoutingService {
     }
   }
 
-  private addLongWalkMetadata(options: RawOption[]) {
+  private addLongWalkMetadata(options: RawOption[], language: Language) {
     for (const opt of options) {
       const firstLeg = opt.segments[0] as any;
       if (
         firstLeg?.type === 'walk' &&
         firstLeg.distanceMeters > LONG_WALK_WARNING_M
       ) {
-        opt.warning =
-          'Note: This route requires a significant walk to the first stop.';
+        opt.warning = ui(language).significantWalkToFirstStop;
       }
     }
   }
@@ -1948,9 +2045,11 @@ export class TransitRoutingService {
     origin: Coords,
     destination: Coords,
     type: 'walk' | 'transit' = 'transit',
+    language: Language = Language.KHMER,
   ) {
-    if (type === 'walk') return this.planWalkRoute(origin, destination);
-    return this.planTransitRoute(origin, destination);
+    if (type === 'walk')
+      return this.planWalkRoute(origin, destination, language);
+    return this.planTransitRoute(origin, destination, language);
   }
 
   // ─── Favorite (skeleton-based) replan ───────────────────────────────────────
@@ -1960,15 +2059,18 @@ export class TransitRoutingService {
   // ETAs / wait times are derived from the current liveEtaMap + anchors.
   // Returns null when any referenced route/stop no longer exists on the route, so
   // the caller can surface a 410 Gone to prompt the user to re-save.
-  async replanFromSkeleton(skeleton: {
-    origin: Coords;
-    destination: Coords;
-    legs: Array<{
-      routeId: string;
-      boardStopId: string;
-      alightStopId: string;
-    }>;
-  }): Promise<{
+  async replanFromSkeleton(
+    skeleton: {
+      origin: Coords;
+      destination: Coords;
+      legs: Array<{
+        routeId: string;
+        boardStopId: string;
+        alightStopId: string;
+      }>;
+    },
+    language: Language = Language.KHMER,
+  ): Promise<{
     totalEstimatedMinutes: number;
     totalDistanceMeters: number;
     totalWalkMeters: number;
@@ -2069,8 +2171,11 @@ export class TransitRoutingService {
       const firstBoard = network.stopInfoMap.get(firstBoardId);
       if (!firstBoard) return null;
       const { seg, minutes } = await buildWalkSegment(
-        { name: 'Your Location', coordinates: skeleton.origin },
-        { name: firstBoard.name, coordinates: firstBoard.coordinates },
+        { name: ui(language).yourLocation, coordinates: skeleton.origin },
+        {
+          name: stopName(firstBoard, language),
+          coordinates: firstBoard.coordinates,
+        },
         false,
       );
       segments.push(seg);
@@ -2123,7 +2228,7 @@ export class TransitRoutingService {
       }> = [
         {
           stopId: leg.boardStopId,
-          name: boardStop.name,
+          name: stopName(boardStop, language),
           coordinates: boardStop.coordinates,
         },
       ];
@@ -2139,7 +2244,7 @@ export class TransitRoutingService {
         if (info) {
           stopSequence.push({
             stopId: curr.stopId,
-            name: info.name,
+            name: stopName(info, language),
             coordinates: info.coordinates,
           });
         }
@@ -2175,12 +2280,12 @@ export class TransitRoutingService {
         },
         boardAt: {
           stopId: leg.boardStopId,
-          name: boardStop.name,
+          name: stopName(boardStop, language),
           coordinates: boardStop.coordinates,
         },
         alightAt: {
           stopId: leg.alightStopId,
-          name: alightStop.name,
+          name: stopName(alightStop, language),
           coordinates: alightStop.coordinates,
         },
         intermediateStops: stopSequence.slice(1, -1),
@@ -2203,8 +2308,14 @@ export class TransitRoutingService {
         const nextBoard = network.stopInfoMap.get(resolved[i + 1].boardStopId);
         if (!nextBoard) return null;
         const { seg, minutes } = await buildWalkSegment(
-          { name: alightStop.name, coordinates: alightStop.coordinates },
-          { name: nextBoard.name, coordinates: nextBoard.coordinates },
+          {
+            name: stopName(alightStop, language),
+            coordinates: alightStop.coordinates,
+          },
+          {
+            name: stopName(nextBoard, language),
+            coordinates: nextBoard.coordinates,
+          },
           true,
         );
         segments.push(seg);
@@ -2220,8 +2331,11 @@ export class TransitRoutingService {
       const lastAlight = network.stopInfoMap.get(last.alightStopId);
       if (!lastAlight) return null;
       const { seg, minutes } = await buildWalkSegment(
-        { name: lastAlight.name, coordinates: lastAlight.coordinates },
-        { name: 'Destination', coordinates: skeleton.destination },
+        {
+          name: stopName(lastAlight, language),
+          coordinates: lastAlight.coordinates,
+        },
+        { name: ui(language).destination, coordinates: skeleton.destination },
         false,
       );
       segments.push(seg);
@@ -2232,7 +2346,7 @@ export class TransitRoutingService {
 
     const warning =
       totalWalkMeters > LONG_WALK_WARNING_M
-        ? `Long walking distance: ${Math.round(totalWalkMeters)}m total`
+        ? ui(language).longWalkWarning(Math.round(totalWalkMeters))
         : undefined;
 
     return {
@@ -2245,7 +2359,11 @@ export class TransitRoutingService {
     };
   }
 
-  private async planWalkRoute(origin: Coords, destination: Coords) {
+  private async planWalkRoute(
+    origin: Coords,
+    destination: Coords,
+    language: Language,
+  ) {
     this.assertCoords(origin, 'planWalkRoute: origin');
     this.assertCoords(destination, 'planWalkRoute: destination');
 
@@ -2273,7 +2391,7 @@ export class TransitRoutingService {
       options: [
         {
           type: 'walk',
-          label: 'Walking',
+          label: ui(language).walking,
           totalEstimatedMinutes: estimatedMinutes,
           totalDistanceMeters: Math.round(distanceMeters),
           totalWalkMeters: Math.round(distanceMeters),
@@ -2281,8 +2399,8 @@ export class TransitRoutingService {
           segments: [
             {
               type: 'walk',
-              from: { name: 'Your Location', coordinates: origin },
-              to: { name: 'Destination', coordinates: destination },
+              from: { name: ui(language).yourLocation, coordinates: origin },
+              to: { name: ui(language).destination, coordinates: destination },
               path: valhallaResult.path,
               distanceMeters: Math.round(distanceMeters),
               estimatedMinutes,
@@ -2293,7 +2411,11 @@ export class TransitRoutingService {
     };
   }
 
-  private async planTransitRoute(origin: Coords, destination: Coords) {
+  private async planTransitRoute(
+    origin: Coords,
+    destination: Coords,
+    language: Language,
+  ) {
     this.assertCoords(origin, 'planTransitRoute: origin');
     this.assertCoords(destination, 'planTransitRoute: destination');
 
@@ -2412,6 +2534,7 @@ export class TransitRoutingService {
           nowMs,
           destSeeds,
           valhallaWalkCache,
+          language,
         );
         rawOptions.push(...opts);
       }
@@ -2462,8 +2585,9 @@ export class TransitRoutingService {
         origin,
         destination,
         lastResult,
+        language,
       );
-      this.addLongWalkMetadata(stabilised);
+      this.addLongWalkMetadata(stabilised, language);
       return this.mapTransitSuccessResponse(stabilised);
     }
 
