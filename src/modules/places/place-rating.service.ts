@@ -44,7 +44,14 @@ export class PlaceRatingService {
   }
 
   async findAllByPlace(placeId: Types.ObjectId): Promise<PlaceRating[]> {
-    return this.placeRatingModel.find({ placeId: placeId.toString() }).exec();
+    // Populate the reviewer's name so the app can show who left each review,
+    // and return newest first. `userId` is stored as the ObjectId hex string,
+    // which Mongoose casts to match User._id during populate.
+    return this.placeRatingModel
+      .find({ placeId: placeId.toString() })
+      .populate('userId', 'name')
+      .sort({ createdAt: -1 })
+      .exec();
   }
 
   async findOne(id: Types.ObjectId): Promise<PlaceRating> {

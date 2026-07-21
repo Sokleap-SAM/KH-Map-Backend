@@ -11,6 +11,7 @@ import { PlaceController } from './place.controller';
 import { PlaceService } from './place.service';
 import { PlaceCategoryService } from './place-category.service';
 import { PlaceRatingService } from './place-rating.service';
+import { RolesGuard } from '../../common/guards/roles.guard';
 
 @Module({
   imports: [
@@ -22,7 +23,12 @@ import { PlaceRatingService } from './place-rating.service';
     PassportModule.register({ defaultStrategy: 'jwt' }),
   ],
   controllers: [PlaceController],
-  providers: [PlaceService, PlaceCategoryService, PlaceRatingService],
+  providers: [
+    PlaceService,
+    PlaceCategoryService,
+    PlaceRatingService,
+    RolesGuard,
+  ],
   exports: [PlaceService, PlaceCategoryService, PlaceRatingService],
 })
 export class PlaceModule {}
