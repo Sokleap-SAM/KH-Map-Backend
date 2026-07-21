@@ -1,10 +1,22 @@
 /* eslint-disable @typescript-eslint/no-unsafe-argument */
 import { Transform } from 'class-transformer';
-import { IsEnum, IsNumber, IsNotEmpty, IsOptional, Min, Max } from 'class-validator';
+import {
+  IsEnum,
+  IsNumber,
+  IsNotEmpty,
+  IsOptional,
+  Min,
+  Max,
+} from 'class-validator';
 
 export enum RouteType {
   WALK = 'walk',
   TRANSIT = 'transit',
+}
+
+export enum Language {
+  ENGLISH = 'english',
+  KHMER = 'khmer',
 }
 
 export class PlanRouteDto {
@@ -39,4 +51,16 @@ export class PlanRouteDto {
   @IsOptional()
   @IsEnum(RouteType)
   type?: RouteType = RouteType.TRANSIT;
+
+  /**
+   * Language for all human-readable text in the response — stop names and the
+   * fixed labels ("Your Location", "Destination", "Walking", warnings).
+   * `khmer` → stop `nameInKhmer`; `english` → stop `nameInLatin`. Defaults to
+   * `khmer` to preserve the previous (Khmer-only) behaviour for old clients.
+   * Route `name`/`code` are returned as stored — the route schema has no
+   * per-language variant.
+   */
+  @IsOptional()
+  @IsEnum(Language)
+  language?: Language = Language.KHMER;
 }

@@ -83,6 +83,25 @@ export class PlaceController {
     return this.categoryService.remove(new Types.ObjectId(categoryId));
   }
 
+  // ─── Bus stops (admin panel) ───────────────────────────────────────────────
+  // Declared BEFORE the generic `:id` routes so "stops" isn't captured as
+  // an ObjectId. These bypass the user-facing category model — the service
+  // forces `category = "Bus Stop"`.
+
+  @Get('stops')
+  findAllStops() {
+    return this.placeService.findAllStops();
+  }
+
+  @Post('stops')
+  @UseInterceptors(FilesInterceptor('photos', 10, { storage: placeStorage }))
+  createStop(
+    @Body() dto: CreatePlaceDto,
+    @UploadedFiles() files?: Express.Multer.File[],
+  ) {
+    return this.placeService.createStop(dto, files);
+  }
+
   // ─── Place requests (user submission → admin approval) ─────────────────────
   // Declared before the generic `:id` routes so the literal `requests` path
   // segment is matched first.

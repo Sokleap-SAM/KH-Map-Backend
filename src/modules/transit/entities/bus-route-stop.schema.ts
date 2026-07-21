@@ -25,9 +25,11 @@ export class BusRouteStop extends BaseEntity {
 
   /**
    * Road geometry of the segment ARRIVING at this stop — the path from the
-   * previous stop in the route sequence to this one. Use multiple coordinates
-   * to trace curves/turns along the actual road. First coordinate should be at
-   * the previous stop's location; last coordinate at this stop's location.
+   * previous stop in the route sequence to this one, road-snapped (Valhalla
+   * `costing=auto`). The polyline starts/ends at the ROAD nearest each stop;
+   * the stops' own coordinates are NOT part of it — stops physically sit on
+   * the sidewalk while buses travel the road. Consecutive segments are
+   * stitched so each one begins where the previous ends.
    * Null for the first stop in a route (no incoming segment).
    *
    * Both TransitRoutingService (`buildRaptorBusSegment`) and BusSimulationService

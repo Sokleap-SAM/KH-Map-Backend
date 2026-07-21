@@ -21,12 +21,14 @@ export class CreateBusRouteStopDto {
   distanceFromPrevious?: number;
 
   /**
-   * Middle waypoints only — [longitude, latitude] pairs tracing the road between
-   * the previous stop and this stop. Do NOT include the start or end coordinates;
-   * the backend auto-prepends the previous stop's location and auto-appends this
-   * stop's location. Omit entirely for a straight line between the two stops.
+   * FULL polyline from the previous stop to this one, stored verbatim —
+   * [longitude, latitude] pairs. Send the output of `/admin/suggest-path`
+   * (optionally steered with vias) after the admin approves it. The raw
+   * stop coordinates must NOT be included: stops sit on the sidewalk, the
+   * path lives on the road.
    *
-   * Example: [[104.919, 11.570], [104.921, 11.573]]
+   * Omit to let the backend compute the road path via Valhalla itself
+   * (optionally through `vias`).
    */
   @IsOptional()
   @IsArray()
@@ -43,4 +45,25 @@ export class CreateBusRouteStopDto {
     return value as [number, number][];
   })
   waypoints?: [number, number][];
+
+  /**
+   * Optional steering points for the backend's Valhalla call — the path is
+   * forced through each via, road-snapped. Ignored when `waypoints` is
+   * provided (the polyline already encodes the admin's choice).
+   */
+  @IsOptional()
+  @IsArray()
+  @IsArray({ each: true })
+  @Transform(({ value }) => {
+    if (value == null) return undefined;
+    if (typeof value === 'string') {
+      try {
+        return JSON.parse(value) as [number, number][];
+      } catch {
+        return value;
+      }
+    }
+    return value as [number, number][];
+  })
+  vias?: [number, number][];
 }

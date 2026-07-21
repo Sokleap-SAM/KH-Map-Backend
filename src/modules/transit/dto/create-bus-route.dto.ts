@@ -22,6 +22,15 @@ export class CreateBusRouteDto {
 
   @IsOptional()
   @IsString()
+  color?: string;
+
+  @IsOptional()
+  @IsString()
+  @IsIn(['outbound', 'inbound'])
+  direction?: 'outbound' | 'inbound';
+
+  @IsOptional()
+  @IsString()
   @IsIn(['active', 'inactive'])
   status?: string;
 
