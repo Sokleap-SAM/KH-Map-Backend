@@ -7,6 +7,7 @@ import {
   Injectable,
   NotFoundException,
   BadRequestException,
+  Logger,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
@@ -34,6 +35,7 @@ export interface TripLiveData {
   latitude: number;
   heading: number;
   busImage: string;
+  mirrored: boolean;
 }
 
 @Injectable()
@@ -62,6 +64,7 @@ export class BusTripService {
       latitude: String(data.latitude),
       heading: String(data.heading || 0),
       busImage: data.busImage || 'bus_go_right.png',
+      mirrored: String(data.mirrored || false),
     });
     // Refresh TTL on every write so abandoned trips eventually expire
     await this.redisService.expire(key, TRIP_LIVE_TTL_SECONDS);
@@ -84,6 +87,7 @@ export class BusTripService {
       latitude: Number(data.latitude),
       heading: Number(data.heading || 0),
       busImage: data.busImage || 'bus_go_right.png',
+      mirrored: data.mirrored === 'true',
     };
   }
 
@@ -159,10 +163,27 @@ export class BusTripService {
       latitude: lat,
       heading: 0,
       busImage: 'bus_go_right.png',
+      mirrored: false,
     });
 
     const live = await this.getLiveData(tripId);
     return this.mergeLiveData(trip.toObject(), live);
+  }
+
+  private getIsometricBusImage(heading: number): string {
+    // Normalize angle to handle negative numbers or wraps safely
+    const angle = ((heading % 360) + 360) % 360;
+
+    // Map to your 4 specific isometric asset files
+    if (angle >= 0 && angle < 90) {
+      return 'bus_up_right.png';
+    } else if (angle >= 90 && angle < 180) {
+      return 'bus_down_right.png';
+    } else if (angle >= 180 && angle < 270) {
+      return 'bus_down_left.png';
+    } else {
+      return 'bus_up_left.png';
+    }
   }
 
   async findAll() {
@@ -244,9 +265,12 @@ export class BusTripService {
     ) {
       const newLng =
         dto.currentLocation?.coordinates[0] ?? currentLive?.longitude ?? 0;
-      const busImage = this.calculateBusDirection(
-        currentLive?.longitude ?? newLng,
-        newLng,
+      // Use the live heading value (defaulting to 0 if not set)
+      const currentHeading = currentLive?.heading ?? 0;
+      const busImage = this.getIsometricBusImage(currentHeading);
+      const logger = new Logger(BusTripService.name);
+      logger.log(
+        `Updating live data for trip ${tripId}: lng=${newLng}, heading=${currentHeading}, busImage=${busImage}`,
       );
 
       const updatedLive: TripLiveData = {
@@ -257,8 +281,9 @@ export class BusTripService {
         longitude: newLng,
         latitude:
           dto.currentLocation?.coordinates[1] ?? currentLive?.latitude ?? 0,
-        heading: 0,
+        heading: currentHeading,
         busImage: busImage,
+        mirrored: false,
       };
       await this.setLiveData(tripId, updatedLive);
     }

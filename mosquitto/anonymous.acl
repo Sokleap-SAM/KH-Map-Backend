@@ -1,0 +1,14 @@
+# Mosquitto ACL for anonymous (unauthenticated) clients in PROD mode.
+# Rider apps connect with no credentials and consume the public transit
+# position stream. They can NEVER publish (no `write` rule below) and
+# cannot read anything outside `transit/#`.
+#
+# Drivers and the backend authenticate via the go-auth plugin — this file
+# is irrelevant to them; their permissions come from the API's
+# /internal/mqtt-auth/acl endpoint.
+#
+# Mosquitto ACL syntax: topic-rules that appear BEFORE any `user` line
+# apply to anonymous clients. `pattern` uses %u/%c substitutions and
+# requires authentication, so it doesn't fit here.
+
+topic read transit/#

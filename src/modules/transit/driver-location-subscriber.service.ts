@@ -157,6 +157,7 @@ export class DriverLocationSubscriberService implements OnModuleInit {
         latitude: data.latitude,
         heading: data.heading ?? 0,
         busImage: previous?.busImage ?? 'bus_go_right.png',
+        mirrored: false,
       });
     } catch (err) {
       this.logger.warn(

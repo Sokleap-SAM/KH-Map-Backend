@@ -63,6 +63,7 @@ interface TripSimState {
    * Undefined when the bus is in motion.
    */
   dwellUntilMs?: number;
+  heading?: number;
 }
 
 // ─── Geometry helpers ─────────────────────────────────────────────────────────
@@ -123,7 +124,7 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
   private wantedRunning = false;
   private startRetryHandle: ReturnType<typeof setTimeout> | null = null;
 
-  async onModuleInit(): Promise<void> {
+  onModuleInit(): void {
     // Don't await — start() may schedule retries (Redis warming up) and we
     // mustn't block the Nest bootstrap on that.
     void this.start();
@@ -403,7 +404,7 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
       currentStopIdx = 0;
       nextStopIdx = stops.length > 1 ? 1 : 0;
       passengerCount = 0;
-      const meta = this.getLiveMetadata(pos);
+      const meta = this.getLiveMetadata(0);
       // Seed Redis so the bus is visible before the first tick fires
       await this.busTripService.setLiveData(tripId, {
         currentStopIndex: currentStopIdx,
@@ -412,6 +413,7 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
         longitude: pos[0],
         latitude: pos[1],
         ...meta,
+        heading: 0,
       });
       // Anchor the route's "last departure from first stop" only when the
       // bus actually started moving (in-progress). Scheduled buses are
@@ -454,6 +456,7 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
       waypointIdx,
       segmentCoords,
       status: tripStatus,
+      heading: live?.heading ?? 0,
     });
 
     this.logger.verbose(
@@ -567,9 +570,11 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
 
     // Heading is meaningless while dwelling (the bus isn't moving), so we
     // publish 0; once dwell ends the next tick computes a real heading.
-    const heading = isDwelling
-      ? 0
+    const isDwellingNow = state.dwellUntilMs !== undefined;
+    const heading = isDwellingNow
+      ? (state.heading ?? this.headingFromState(segCoords, pos, waypointIdx))
       : this.headingFromState(segCoords, pos, waypointIdx);
+    state.heading = heading;
     // Reported speed mirrors actual motion so live ETAs and the UI don't
     // imply the bus is still moving while it dwells.
     const reportedSpeed = isDwelling ? 0 : Math.round(BUS_SIMULATION_SPEED_KMH);
@@ -577,7 +582,7 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
     state.pos = pos;
     state.waypointIdx = waypointIdx;
     state.segmentCoords = segCoords;
-    const meta = this.getLiveMetadata(pos);
+    const meta = this.getLiveMetadata(0);
 
     // Publish to Redis
     const liveData: TripLiveData = {
@@ -587,6 +592,7 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
       longitude: pos[0],
       latitude: pos[1],
       ...meta,
+      heading: heading,
     };
     await this.busTripService.setLiveData(state.tripId, liveData);
 
@@ -744,6 +750,7 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
    */
   private async completeTrip(
     state: TripSimState,
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
     _stops: BusRouteStop[],
   ): Promise<void> {
     const tripId = state.tripId;
@@ -945,16 +952,27 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
     return [currentPos, stopCoords(stops[nextStopIdx].stop)];
   }
 
-  private getLiveMetadata(
-    currentPos: [number, number],
-    prevPos?: [number, number],
-  ) {
-    const lng = currentPos[0];
-    const prevLng = prevPos ? prevPos[0] : lng;
+  private getLiveMetadata(heading: number) {
+    // Normalize angle to handle negative numbers or wraps safely
+    const angle = ((heading % 360) + 360) % 360;
+
+    let busImage = 'bus_up_right.png';
+
+    // Map the 360° compass quadrant directly to your 4 isometric files
+    if (angle >= 0 && angle < 90) {
+      busImage = 'bus_up_right.png'; // Moving Top-Right (North-East)
+    } else if (angle >= 90 && angle < 180) {
+      busImage = 'bus_down_right.png'; // Moving Bottom-Right (South-East)
+    } else if (angle >= 180 && angle < 270) {
+      busImage = 'bus_down_left.png'; // Moving Bottom-Left (South-West)
+    } else {
+      busImage = 'bus_up_left.png'; // Moving Top-Left (North-West)
+    }
 
     return {
-      heading: 0,
-      busImage: lng < prevLng ? 'bus_go_left.png' : 'bus_go_right.png',
+      heading: angle,
+      busImage,
+      mirrored: false, // Fully clean out mirroring logic
     };
   }
 }

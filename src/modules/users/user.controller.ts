@@ -50,6 +50,21 @@ export class UsersController {
     return this.usersService.create(createUserDto);
   }
 
+  @Post('verify')
+  async verify(@Body('email') email: string, @Body('otp') otp: string) {
+    return this.usersService.verifyRegistration(email, otp);
+  }
+
+  @Post('resend-code')
+  async resendCode(@Body('email') email: string) {
+    return this.usersService.resendVerificationCode(email);
+  }
+
+  @Post('google-login')
+  async googleLogin(@Body('idToken') idToken: string) {
+    return this.usersService.googleLogin(idToken);
+  }
+
   @Post('login')
   async login(@Body() loginDto: LoginDto) {
     return this.usersService.login(loginDto);
