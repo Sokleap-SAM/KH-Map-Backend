@@ -226,6 +226,20 @@ export class PlaceController {
     return this.placeService.remove(new Types.ObjectId(id));
   }
 
+  /**
+   * The caller's own ratings across every place (newest first), each with the
+   * rated place populated — lets the app rebuild "My Contributions" from the
+   * database after local storage is lost. The literal `ratings` segment can't
+   * be captured by the single-segment `:id` route above, so this is safe here.
+   */
+  @Get('ratings/mine')
+  @UseGuards(JwtAuthGuard)
+  findMyRatings(@Req() req: AuthenticatedRequest) {
+    return this.ratingService.findAllByUser(
+      new Types.ObjectId(req.user.userId),
+    );
+  }
+
   @Post(':placeId/ratings')
   @UseGuards(JwtAuthGuard)
   @UseInterceptors(FilesInterceptor('photos', 10, { storage: ratingStorage }))

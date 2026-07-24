@@ -54,6 +54,20 @@ export class PlaceRatingService {
       .exec();
   }
 
+  /**
+   * Every rating the given user has left, newest first, with the rated place
+   * (and its category) populated so the app can rebuild its "My Contributions"
+   * list from the database alone. A rating whose place has since been deleted
+   * comes back with `placeId: null` — clients should skip those entries.
+   */
+  async findAllByUser(userId: Types.ObjectId): Promise<PlaceRating[]> {
+    return this.placeRatingModel
+      .find({ userId: userId.toString() })
+      .populate({ path: 'placeId', populate: { path: 'category' } })
+      .sort({ createdAt: -1 })
+      .exec();
+  }
+
   async findOne(id: Types.ObjectId): Promise<PlaceRating> {
     const rating = await this.placeRatingModel.findById(id).exec();
     if (!rating)
