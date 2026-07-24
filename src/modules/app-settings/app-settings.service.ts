@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-unsafe-enum-comparison */
-import { Injectable, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { AppSetting, AppSettingDocument } from './entities/app-setting.schema';
@@ -9,6 +9,8 @@ const TRANSIT_MODE_KEY = 'transit.mode';
 
 @Injectable()
 export class AppSettingsService implements OnModuleInit {
+  private readonly logger = new Logger(AppSettingsService.name);
+
   // In-memory cache so per-tick mode reads in the simulator and dispatch
   // services don't hit Mongo. Refreshed only on explicit setMode() — there's
   // no other writer.
@@ -37,6 +39,7 @@ export class AppSettingsService implements OnModuleInit {
     } else {
       this.modeCache = this.parseMode(doc.value);
     }
+    this.logger.log(`Transit mode = ${this.modeCache}`);
   }
 
   getMode(): TransitMode {
@@ -52,6 +55,7 @@ export class AppSettingsService implements OnModuleInit {
       )
       .exec();
     this.modeCache = mode;
+    this.logger.log(`Transit mode set to ${mode}`);
     return mode;
   }
 

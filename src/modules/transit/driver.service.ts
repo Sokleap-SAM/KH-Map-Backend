@@ -4,6 +4,7 @@ import {
   ConflictException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -18,6 +19,8 @@ import { TransitMode } from '../app-settings/enums/transit-mode.enum';
 
 @Injectable()
 export class DriverService {
+  private readonly logger = new Logger(DriverService.name);
+
   constructor(
     @InjectModel(BusTrip.name)
     private readonly busTripModel: Model<BusTripDocument>,
@@ -244,6 +247,7 @@ export class DriverService {
       .exec();
     await this.busTripService.clearLiveData(tripId);
 
+    this.logger.log(`Driver ${driverId} cancelled trip ${tripId}`);
     return { cancelled: true, tripId };
   }
 }
