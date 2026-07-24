@@ -20,6 +20,8 @@ import Redis from 'ioredis';
 import { MailerService } from '@nestjs-modules/mailer';
 import { UserRole, UserStatus } from './enums/role.enum';
 import { Types } from 'mongoose';
+import { initializeApp, getApps } from 'firebase-admin/app';
+import { getAuth, DecodedIdToken } from 'firebase-admin/auth';
 
 @Injectable()
 export class UsersService {
@@ -32,20 +34,83 @@ export class UsersService {
   ) {}
 
   async create(userData: CreateUserDto) {
+    const cleanEmail = userData.email.trim().toLowerCase();
     const salt = await bcrypt.genSalt();
     const hashedPassword = await bcrypt.hash(userData.password, salt);
 
-    // Role is hard-coded here, never taken from input — public registration
-    // creates only normal users. Promotion to driver/admin is admin-only via
-    // setRole below.
-    const newUser = new this.userModel({
-      ...userData,
-      password: hashedPassword,
-      role: UserRole.USER,
-      status: UserStatus.OFF,
-      assignedBusId: null,
-    });
-    return newUser.save();
+    let user = await this.userModel.findOne({ email: cleanEmail }).exec();
+    if (user) {
+      if (user.isVerified) {
+        throw new ConflictException(
+          'អ៊ីមែលនេះត្រូវបានប្រើប្រាស់រួចហើយ (Email already registered)',
+        );
+      }
+      // Update details for retry
+      user.name = userData.name;
+      user.password = hashedPassword;
+      await user.save();
+    } else {
+      user = new this.userModel({
+        ...userData,
+        email: cleanEmail,
+        password: hashedPassword,
+        role: UserRole.USER,
+        status: UserStatus.OFF,
+        assignedBusId: null,
+        isVerified: false,
+      });
+      await user.save();
+    }
+
+    // Generate 6-digit verification code
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+
+    // Save to Redis for 15 minutes (900 seconds)
+    await this.redis.set(`verify_otp:${cleanEmail}`, otp, 'EX', 900);
+
+    // Send email
+    try {
+      await this.mailerService.sendMail({
+        to: cleanEmail,
+        subject: 'លេខកូដផ្ទៀងផ្ទាត់គណនី - KH-Map',
+        text: `លេខកូដផ្ទៀងផ្ទាត់របស់អ្នកគឺ: ${otp}`,
+      });
+    } catch (err) {
+      console.error('Failed to send registration verification mail:', err);
+    }
+
+    return {
+      message: 'លេខកូដផ្ទៀងផ្ទាត់ត្រូវបានផ្ញើ (Verification code sent)',
+      email: cleanEmail,
+    };
+  }
+
+  async createFromFirebase(payload: {
+    email: string;
+    name: string;
+    firebaseUid: string;
+  }) {
+    const { email, name, firebaseUid } = payload;
+    const cleanEmail = email.trim().toLowerCase();
+
+    let user = await this.userModel.findOne({ email: cleanEmail }).exec();
+    if (!user) {
+      user = new this.userModel({
+        name,
+        email: cleanEmail,
+        firebaseUid,
+        isVerified: true,
+        role: UserRole.USER,
+        status: UserStatus.OFF,
+        assignedBusId: null,
+      });
+      await user.save();
+    } else {
+      user.firebaseUid = firebaseUid;
+      user.isVerified = true;
+      await user.save();
+    }
+    return user;
   }
 
   // Admin-only: change a user's role. When demoting a driver, clear the
@@ -168,12 +233,246 @@ export class UsersService {
 
   async login(loginDto: LoginDto) {
     const { email, password } = loginDto;
+    const cleanEmail = email.trim().toLowerCase();
 
-    const user = await this.userModel.findOne({ email }).exec();
+    const user = await this.userModel.findOne({ email: cleanEmail }).exec();
 
-    if (!user || !(await bcrypt.compare(password, user.password))) {
-      throw new UnauthorizedException('Invalid email or password');
+    if (
+      !user ||
+      !user.password ||
+      !(await bcrypt.compare(password, user.password))
+    ) {
+      throw new UnauthorizedException(
+        'អ៊ីមែល ឬលេខសម្ងាត់មិនត្រឹមត្រូវ (Invalid email or password)',
+      );
     }
+
+    if (!user.isVerified) {
+      // Auto-trigger a code resend for their convenience
+      try {
+        const otp = Math.floor(100000 + Math.random() * 900000).toString();
+        await this.redis.set(`verify_otp:${cleanEmail}`, otp, 'EX', 900);
+        await this.mailerService.sendMail({
+          to: cleanEmail,
+          subject: 'លេខកូដផ្ទៀងផ្ទាត់គណនី - KH-Map',
+          text: `លេខកូដផ្ទៀងផ្ទាត់របស់អ្នកគឺ: ${otp}`,
+        });
+      } catch (e) {
+        console.error('Failed to send login unverified OTP code:', e);
+      }
+      throw new UnauthorizedException('UNVERIFIED_ACCOUNT');
+    }
+
+    const payload = {
+      sub: user._id,
+      email: user.email,
+      role: user.role,
+      name: user.name,
+    };
+
+    return {
+      access_token: this.jwtService.sign(payload),
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+      },
+    };
+  }
+
+  async verifyRegistration(email: string, otp: string) {
+    const cleanEmail = email.trim().toLowerCase();
+    const savedOtp = await this.redis.get(`verify_otp:${cleanEmail}`);
+    if (!savedOtp || savedOtp !== otp.trim()) {
+      throw new BadRequestException(
+        'លេខកូដមិនត្រឹមត្រូវ ឬហួសកំណត់ (Invalid or expired code)',
+      );
+    }
+    const user = await this.userModel.findOne({ email: cleanEmail }).exec();
+    if (!user) throw new NotFoundException('រកមិនឃើញគណនីទេ (User not found)');
+
+    user.isVerified = true;
+    await user.save();
+    await this.redis.del(`verify_otp:${cleanEmail}`);
+
+    const payload = {
+      sub: user._id,
+      email: user.email,
+      role: user.role,
+      name: user.name,
+    };
+
+    return {
+      access_token: this.jwtService.sign(payload),
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+      },
+    };
+  }
+
+  async resendVerificationCode(email: string) {
+    const cleanEmail = email.trim().toLowerCase();
+    const user = await this.userModel.findOne({ email: cleanEmail }).exec();
+    if (!user) throw new NotFoundException('រកមិនឃើញគណនីទេ (User not found)');
+    if (user.isVerified) {
+      throw new BadRequestException(
+        'គណនីនេះត្រូវបានផ្ទៀងផ្ទាត់រួចហើយ (Account is already verified)',
+      );
+    }
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    await this.redis.set(`verify_otp:${cleanEmail}`, otp, 'EX', 900);
+
+    try {
+      await this.mailerService.sendMail({
+        to: cleanEmail,
+        subject: 'លេខកូដផ្ទៀងផ្ទាត់គណនី - KH-Map',
+        text: `លេខកូដផ្ទៀងផ្ទាត់ថ្មីរបស់អ្នកគឺ: ${otp}`,
+      });
+    } catch (err) {
+      console.error('Failed to resend verification mail:', err);
+    }
+
+    return { message: 'លេខកូដត្រូវបានផ្ញើឡើងវិញជោគជ័យ' };
+  }
+
+  async googleLogin(idToken: string) {
+    try {
+      let email: string;
+      let name: string;
+      let googleId: string;
+
+      if (
+        process.env.NODE_ENV === 'development' &&
+        idToken.startsWith('mock_google_')
+      ) {
+        email = idToken.substring('mock_google_'.length).trim().toLowerCase();
+        name = email.split('@')[0];
+        googleId = 'mock_google_id_' + Date.now();
+      } else {
+        // 1. Call Google Token Info API to verify
+        const verifyUrl = `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`;
+        const response = await fetch(verifyUrl);
+        if (!response.ok) {
+          throw new UnauthorizedException('Google token validation failed');
+        }
+        const payload = await response.json();
+
+        if (
+          payload.email_verified !== 'true' &&
+          payload.email_verified !== true
+        ) {
+          throw new UnauthorizedException('Google email not verified');
+        }
+
+        email = payload.email.trim().toLowerCase();
+        name = payload.name || email.split('@')[0];
+        googleId = payload.sub;
+      }
+
+      // 2. Find or create user
+      let user = await this.userModel.findOne({ email }).exec();
+      if (user) {
+        let saveNeeded = false;
+        if (!user.googleId) {
+          user.googleId = googleId;
+          saveNeeded = true;
+        }
+        if (!user.isVerified) {
+          user.isVerified = true;
+          saveNeeded = true;
+        }
+        if (saveNeeded) {
+          await user.save();
+        }
+      } else {
+        user = new this.userModel({
+          name,
+          email,
+          role: UserRole.USER,
+          status: UserStatus.OFF,
+          assignedBusId: null,
+          googleId,
+          isVerified: true,
+        });
+        await user.save();
+      }
+
+      // 3. Generate token
+      const jwtPayload = {
+        sub: user._id,
+        email: user.email,
+        role: user.role,
+        name: user.name,
+      };
+
+      return {
+        access_token: this.jwtService.sign(jwtPayload),
+        user: {
+          id: user._id,
+          name: user.name,
+          email: user.email,
+        },
+      };
+    } catch (error) {
+      if (error instanceof UnauthorizedException) throw error;
+      throw new UnauthorizedException(
+        'Failed to login with Google: ' + (error as Error).message,
+      );
+    }
+  }
+
+  /**
+   * One-click sign-in with Firebase. The frontend authenticates the user with
+   * the Firebase client SDK (Google / Apple / email-link / etc.), obtains a
+   * Firebase ID token, and posts it here. We verify the token with the Firebase
+   * Admin SDK, find-or-create the matching Mongo user (verified, no password),
+   * and return OUR own app JWT — so from this point on the client uses the same
+   * `access_token` as every other sign-in path and hits the same JwtAuthGuard.
+   *
+   * Only the project ID is needed to VERIFY tokens; the Admin SDK fetches
+   * Google's public signing keys over HTTP. A service-account credential is
+   * only required for privileged operations we don't perform here.
+   */
+  async firebaseLogin(idToken: string) {
+    if (!idToken) {
+      throw new BadRequestException('idToken is required');
+    }
+
+    if (getApps().length === 0) {
+      initializeApp({
+        projectId: process.env.FIREBASE_PROJECT_ID || 'khmapauth',
+      });
+    }
+
+    let decoded: DecodedIdToken;
+    try {
+      decoded = await getAuth().verifyIdToken(idToken);
+    } catch {
+      throw new UnauthorizedException(
+        'Firebase token មិនត្រឹមត្រូវ ឬហួសកំណត់ (Invalid or expired Firebase token)',
+      );
+    }
+
+    const email = decoded.email?.trim().toLowerCase();
+    if (!email) {
+      throw new UnauthorizedException(
+        'Firebase token គ្មានអ៊ីមែល (Firebase token has no email)',
+      );
+    }
+
+    const name =
+      typeof decoded.name === 'string' && decoded.name.trim()
+        ? decoded.name.trim()
+        : email.split('@')[0];
+
+    const user = await this.createFromFirebase({
+      email,
+      name,
+      firebaseUid: decoded.uid,
+    });
 
     const payload = {
       sub: user._id,
