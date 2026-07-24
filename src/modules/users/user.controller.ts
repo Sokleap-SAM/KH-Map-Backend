@@ -65,6 +65,14 @@ export class UsersController {
     return this.usersService.googleLogin(idToken);
   }
 
+  // One-click sign-in: frontend sends the Firebase ID token it obtained from
+  // the Firebase client SDK; we verify it, provision the user, and return our
+  // own { access_token, user }.
+  @Post('firebase-login')
+  async firebaseLogin(@Body('idToken') idToken: string) {
+    return this.usersService.firebaseLogin(idToken);
+  }
+
   @Post('login')
   async login(@Body() loginDto: LoginDto) {
     return this.usersService.login(loginDto);

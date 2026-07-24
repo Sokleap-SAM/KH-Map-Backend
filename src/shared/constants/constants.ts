@@ -13,16 +13,16 @@ export const TRANSFER_WALK_BASE_RADIUS_M = 1000;
 export const TRANSFER_WALK_RADIUS_GROWTH_PER_ROUND_M = 500;
 
 /** Hard cap for transfer walk radius (meters) in later RAPTOR rounds. */
-export const TRANSFER_WALK_MAX_RADIUS_M = 3000;
+export const TRANSFER_WALK_MAX_RADIUS_M = 2000;
 
 /** Time penalty (minutes) added when transferring between routes */
-export const TRANSFER_PENALTY_MIN = 2;
+export const TRANSFER_PENALTY_MIN = 1;
 
 /**
  * Catchability buffer (minutes): a bus is only catchable if it arrives at least
- * this many minutes AFTER the user reaches the stop. Spec: 2-minute buffer.
+ * this many minutes AFTER the user reaches the stop. Spec: 1-minute buffer.
  */
-export const MIN_WAIT_MIN = 1;
+export const MIN_WAIT_MIN = 0;
 
 /**
  * Extra catchability buffer applied ONLY at transfer boardings (round > 1).
@@ -33,7 +33,7 @@ export const MIN_WAIT_MIN = 1;
  * and we project the next lap. Does NOT apply to the first boarding from origin,
  * where the user controls their start time precisely.
  */
-export const TRANSFER_UNCERTAINTY_BUFFER_MIN = 5;
+export const TRANSFER_UNCERTAINTY_BUFFER_MIN = 2;
 
 /**
  * Dwell time (minutes) the bus is stationary at each intermediate stop while
@@ -41,7 +41,7 @@ export const TRANSFER_UNCERTAINTY_BUFFER_MIN = 5;
  * stop systematically under-promising on long rides, and enforced in the
  * simulator so the on-map bus matches what the routing engine predicts.
  */
-export const DWELL_TIME_MIN = 25 / 60;
+export const DWELL_TIME_MIN = 20 / 60;
 
 // ─── Bus Simulation ───────────────────────────────────────────────────────────
 
@@ -122,7 +122,10 @@ export const ROUTE_DEPARTURE_ANCHOR_TTL_SECONDS = 24 * 60 * 60;
 export const NETWORK_CACHE_TTL_MS = 5 * 60 * 1000;
 
 /** Redis key for the persisted, pre-computed transit network snapshot. */
-export const NETWORK_CACHE_REDIS_KEY = 'transit:network:v1';
+// Bumped v1→v2 when StopInfo gained nameInKhmer/nameInLatin (was a single
+// `name`). The version suffix ensures a deploy doesn't rehydrate the old
+// snapshot shape, which would surface stops with undefined names until TTL.
+export const NETWORK_CACHE_REDIS_KEY = 'transit:network:v2';
 
 /**
  * TTL (seconds) for the Redis-backed network cache. Long because we invalidate
@@ -137,6 +140,15 @@ export const NETWORK_CACHE_REDIS_TTL_SECONDS = 24 * 60 * 60;
  * ValhallaService timeout while keeping total HTTP overhead small.
  */
 export const VALHALLA_FOOTPATH_SOURCE_BATCH = 50;
+
+/**
+ * Max target stops per one-to-many Valhalla walk-matrix call when resolving
+ * origin/destination access-stop durations (resolveAccessStop). A single
+ * source (the origin or destination) against up to this many stop targets goes
+ * in one HTTP round-trip instead of one getWalkPath per stop. Bounds matrix
+ * size so a large network still stays under the ValhallaService timeout.
+ */
+export const WALK_MATRIX_MAX_TARGETS = 200;
 
 /**
  * Live ETA cache TTL in milliseconds. Multiple plan requests within this window
@@ -160,6 +172,18 @@ export const RAPTOR_MAX_ROUNDS = 4;
 
 /** Transfer penalty (minutes) used for ranking options (larger than TRANSFER_PENALTY_MIN) */
 export const TRANSFER_PENALTY_FOR_RANKING = 15;
+
+/**
+ * Ranking bonus (in score-minutes) awarded to an option that keeps the user on
+ * a route they're already committed to, when GET /transit/plan is called with
+ * `preferRouteIds`. Scaled by the fraction of the journey that stays on the
+ * preferred routes (full match → this value; partial → proportionally less).
+ * Sized at one transfer-penalty so a committed journey can hold its rank
+ * against a marginally faster alternative on a triggered (off-route) re-plan,
+ * without letting a much slower option outrank a genuinely faster one. Pure
+ * tie-breaker — it only reorders options the solver already found.
+ */
+export const COMMITTED_ROUTE_BIAS_MIN = 15;
 
 /**
  * Slack (minutes) for the round-1 footpath improvement check. RAPTOR's strict

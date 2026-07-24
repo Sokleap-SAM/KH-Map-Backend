@@ -20,6 +20,8 @@ import Redis from 'ioredis';
 import { MailerService } from '@nestjs-modules/mailer';
 import { UserRole, UserStatus } from './enums/role.enum';
 import { Types } from 'mongoose';
+import { initializeApp, getApps } from 'firebase-admin/app';
+import { getAuth, DecodedIdToken } from 'firebase-admin/auth';
 
 @Injectable()
 export class UsersService {
@@ -39,7 +41,9 @@ export class UsersService {
     let user = await this.userModel.findOne({ email: cleanEmail }).exec();
     if (user) {
       if (user.isVerified) {
-        throw new ConflictException('អ៊ីមែលនេះត្រូវបានប្រើប្រាស់រួចហើយ (Email already registered)');
+        throw new ConflictException(
+          'អ៊ីមែលនេះត្រូវបានប្រើប្រាស់រួចហើយ (Email already registered)',
+        );
       }
       // Update details for retry
       user.name = userData.name;
@@ -60,7 +64,7 @@ export class UsersService {
 
     // Generate 6-digit verification code
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    
+
     // Save to Redis for 15 minutes (900 seconds)
     await this.redis.set(`verify_otp:${cleanEmail}`, otp, 'EX', 900);
 
@@ -75,10 +79,17 @@ export class UsersService {
       console.error('Failed to send registration verification mail:', err);
     }
 
-    return { message: 'លេខកូដផ្ទៀងផ្ទាត់ត្រូវបានផ្ញើ (Verification code sent)', email: cleanEmail };
+    return {
+      message: 'លេខកូដផ្ទៀងផ្ទាត់ត្រូវបានផ្ញើ (Verification code sent)',
+      email: cleanEmail,
+    };
   }
 
-  async createFromFirebase(payload: { email: string; name: string; firebaseUid: string }) {
+  async createFromFirebase(payload: {
+    email: string;
+    name: string;
+    firebaseUid: string;
+  }) {
     const { email, name, firebaseUid } = payload;
     const cleanEmail = email.trim().toLowerCase();
 
@@ -226,8 +237,14 @@ export class UsersService {
 
     const user = await this.userModel.findOne({ email: cleanEmail }).exec();
 
-    if (!user || !user.password || !(await bcrypt.compare(password, user.password))) {
-      throw new UnauthorizedException('អ៊ីមែល ឬលេខសម្ងាត់មិនត្រឹមត្រូវ (Invalid email or password)');
+    if (
+      !user ||
+      !user.password ||
+      !(await bcrypt.compare(password, user.password))
+    ) {
+      throw new UnauthorizedException(
+        'អ៊ីមែល ឬលេខសម្ងាត់មិនត្រឹមត្រូវ (Invalid email or password)',
+      );
     }
 
     if (!user.isVerified) {
@@ -267,11 +284,13 @@ export class UsersService {
     const cleanEmail = email.trim().toLowerCase();
     const savedOtp = await this.redis.get(`verify_otp:${cleanEmail}`);
     if (!savedOtp || savedOtp !== otp.trim()) {
-      throw new BadRequestException('លេខកូដមិនត្រឹមត្រូវ ឬហួសកំណត់ (Invalid or expired code)');
+      throw new BadRequestException(
+        'លេខកូដមិនត្រឹមត្រូវ ឬហួសកំណត់ (Invalid or expired code)',
+      );
     }
     const user = await this.userModel.findOne({ email: cleanEmail }).exec();
     if (!user) throw new NotFoundException('រកមិនឃើញគណនីទេ (User not found)');
-    
+
     user.isVerified = true;
     await user.save();
     await this.redis.del(`verify_otp:${cleanEmail}`);
@@ -298,12 +317,14 @@ export class UsersService {
     const user = await this.userModel.findOne({ email: cleanEmail }).exec();
     if (!user) throw new NotFoundException('រកមិនឃើញគណនីទេ (User not found)');
     if (user.isVerified) {
-      throw new BadRequestException('គណនីនេះត្រូវបានផ្ទៀងផ្ទាត់រួចហើយ (Account is already verified)');
+      throw new BadRequestException(
+        'គណនីនេះត្រូវបានផ្ទៀងផ្ទាត់រួចហើយ (Account is already verified)',
+      );
     }
-    
+
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     await this.redis.set(`verify_otp:${cleanEmail}`, otp, 'EX', 900);
-    
+
     try {
       await this.mailerService.sendMail({
         to: cleanEmail,
@@ -323,7 +344,10 @@ export class UsersService {
       let name: string;
       let googleId: string;
 
-      if (process.env.NODE_ENV === 'development' && idToken.startsWith('mock_google_')) {
+      if (
+        process.env.NODE_ENV === 'development' &&
+        idToken.startsWith('mock_google_')
+      ) {
         email = idToken.substring('mock_google_'.length).trim().toLowerCase();
         name = email.split('@')[0];
         googleId = 'mock_google_id_' + Date.now();
@@ -335,8 +359,11 @@ export class UsersService {
           throw new UnauthorizedException('Google token validation failed');
         }
         const payload = await response.json();
-        
-        if (payload.email_verified !== 'true' && payload.email_verified !== true) {
+
+        if (
+          payload.email_verified !== 'true' &&
+          payload.email_verified !== true
+        ) {
           throw new UnauthorizedException('Google email not verified');
         }
 
@@ -391,12 +418,91 @@ export class UsersService {
       };
     } catch (error) {
       if (error instanceof UnauthorizedException) throw error;
-      throw new UnauthorizedException('Failed to login with Google: ' + (error as Error).message);
+      throw new UnauthorizedException(
+        'Failed to login with Google: ' + (error as Error).message,
+      );
     }
+  }
+
+  /**
+   * One-click sign-in with Firebase. The frontend authenticates the user with
+   * the Firebase client SDK (Google / Apple / email-link / etc.), obtains a
+   * Firebase ID token, and posts it here. We verify the token with the Firebase
+   * Admin SDK, find-or-create the matching Mongo user (verified, no password),
+   * and return OUR own app JWT — so from this point on the client uses the same
+   * `access_token` as every other sign-in path and hits the same JwtAuthGuard.
+   *
+   * Only the project ID is needed to VERIFY tokens; the Admin SDK fetches
+   * Google's public signing keys over HTTP. A service-account credential is
+   * only required for privileged operations we don't perform here.
+   */
+  async firebaseLogin(idToken: string) {
+    if (!idToken) {
+      throw new BadRequestException('idToken is required');
+    }
+
+    if (getApps().length === 0) {
+      initializeApp({
+        projectId: process.env.FIREBASE_PROJECT_ID || 'khmapauth',
+      });
+    }
+
+    let decoded: DecodedIdToken;
+    try {
+      decoded = await getAuth().verifyIdToken(idToken);
+    } catch {
+      throw new UnauthorizedException(
+        'Firebase token មិនត្រឹមត្រូវ ឬហួសកំណត់ (Invalid or expired Firebase token)',
+      );
+    }
+
+    const email = decoded.email?.trim().toLowerCase();
+    if (!email) {
+      throw new UnauthorizedException(
+        'Firebase token គ្មានអ៊ីមែល (Firebase token has no email)',
+      );
+    }
+
+    const name =
+      typeof decoded.name === 'string' && decoded.name.trim()
+        ? decoded.name.trim()
+        : email.split('@')[0];
+
+    const user = await this.createFromFirebase({
+      email,
+      name,
+      firebaseUid: decoded.uid,
+    });
+
+    const payload = {
+      sub: user._id,
+      email: user.email,
+      role: user.role,
+      name: user.name,
+    };
+
+    return {
+      access_token: this.jwtService.sign(payload),
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+      },
+    };
   }
 
   async findByEmail(email: string) {
     return this.userModel.findOne({ email }).exec();
+  }
+
+  /**
+   * Count users by role, optionally narrowed by status (on/off shift).
+   * Used by the admin dashboard for at-a-glance fleet visibility.
+   */
+  async countByRole(role: UserRole, status?: UserStatus): Promise<number> {
+    const query: Record<string, unknown> = { role };
+    if (status) query.status = status;
+    return this.userModel.countDocuments(query).exec();
   }
 
   async forgotPassword(email: string) {

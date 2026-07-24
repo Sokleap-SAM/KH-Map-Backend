@@ -21,4 +21,8 @@ export const envValidationSchema = Joi.object({
   MQTT_USERNAME: Joi.string().optional().allow(''),
   MQTT_PASSWORD: Joi.string().optional().allow(''),
   MQTT_CLIENT_ID: Joi.string().optional().allow(''),
+  // Firebase project ID — used to verify Firebase ID tokens for one-click
+  // sign-in (POST /users/firebase-login). Only the project ID is required;
+  // token verification fetches Google's public keys automatically.
+  FIREBASE_PROJECT_ID: Joi.string().optional().allow(''),
 });

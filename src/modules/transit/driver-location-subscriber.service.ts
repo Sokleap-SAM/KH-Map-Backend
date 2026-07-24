@@ -1,4 +1,4 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Injectable, OnModuleInit } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
 import { MqttService } from '../../shared/mqtt/mqtt.service';
@@ -31,8 +31,6 @@ interface DriverLocationPayload {
 
 @Injectable()
 export class DriverLocationSubscriberService implements OnModuleInit {
-  private readonly logger = new Logger(DriverLocationSubscriberService.name);
-
   // Per-driver guard against out-of-order and too-frequent publishes. Kept
   // in-process — single source of truth is fine because driver auth pins
   // each driver to one MQTT session at a time.
@@ -75,13 +73,9 @@ export class DriverLocationSubscriberService implements OnModuleInit {
     try {
       data = JSON.parse(payload.toString('utf8')) as DriverLocationPayload;
     } catch {
-      this.logger.warn(`Invalid JSON on ${topic}`);
       return;
     }
-    if (!isValidPayload(data)) {
-      this.logger.warn(`Invalid payload shape on ${topic}`);
-      return;
-    }
+    if (!isValidPayload(data)) return;
 
     // Time-skew window — rejects publishes that were too long ago (replay)
     // or claim to be from the future (clock drift exploit).
@@ -91,9 +85,6 @@ export class DriverLocationSubscriberService implements OnModuleInit {
         !Number.isFinite(ts) ||
         Math.abs(now - ts) > MAX_RECORDED_AT_SKEW_MS
       ) {
-        this.logger.warn(
-          `Stale/skewed recordedAt from driver ${driverId} on ${topic}`,
-        );
         return;
       }
     }
@@ -159,10 +150,7 @@ export class DriverLocationSubscriberService implements OnModuleInit {
         busImage: previous?.busImage ?? 'bus_go_right.png',
         mirrored: false,
       });
-    } catch (err) {
-      this.logger.warn(
-        `reportLocation failed for driver ${driverId} trip ${tripId}: ${(err as Error).message}`,
-      );
+    } catch {
       return;
     }
 
@@ -182,10 +170,6 @@ export class DriverLocationSubscriberService implements OnModuleInit {
         source: 'driver',
       },
       { qos: 0, retain: true },
-    );
-
-    this.logger.log(
-      `[live] driver=${driverId} bus=${busId} trip=${tripId} route=${routeId} @ ${data.longitude.toFixed(5)},${data.latitude.toFixed(5)} spd=${data.speed ?? 0}`,
     );
   }
 }

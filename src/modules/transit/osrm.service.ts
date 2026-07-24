@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-unsafe-assignment */
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 
 type Coords = [number, number];
 
@@ -11,7 +11,6 @@ export interface OsrmWalkResult {
 
 @Injectable()
 export class OsrmService {
-  private readonly logger = new Logger(OsrmService.name);
   private readonly baseUrl: string;
 
   constructor() {
@@ -46,9 +45,6 @@ export class OsrmService {
             await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
             continue;
           }
-          this.logger.warn(
-            `OSRM failed with status ${res.status} for URL: ${url}`,
-          );
           return null;
         }
 
@@ -66,12 +62,8 @@ export class OsrmService {
           // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
           durationSeconds: route.duration as number,
         };
-      } catch (err: unknown) {
-        if (attempt === retries) {
-          const msg = err instanceof Error ? err.message : String(err);
-          this.logger.warn(`OSRM walk path failed: ${msg}`);
-          return null;
-        }
+      } catch {
+        if (attempt === retries) return null;
         await new Promise((r) => setTimeout(r, 200 * (attempt + 1)));
       }
     }

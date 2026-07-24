@@ -8,6 +8,7 @@ import {
   Patch,
   Post,
   Query,
+  ServiceUnavailableException,
   UseGuards,
 } from '@nestjs/common';
 import { Types } from 'mongoose';
@@ -28,7 +29,9 @@ import { CreateBusRouteStopDto } from './dto/create-bus-route-stop.dto';
 import { UpdateBusRouteStopDto } from './dto/update-bus-route-stop.dto';
 import { BulkBusRouteStopsDto } from './dto/bulk-bus-route-stops.dto';
 import { SuggestPathDto } from './dto/suggest-path.dto';
+import { DashboardQueryDto } from './dto/dashboard-query.dto';
 import { ValhallaService } from './valhalla.service';
+import { AdminDashboardService } from './admin-dashboard.service';
 import { CreateBusDto } from './dto/create-bus.dto';
 import { UpdateBusDto } from './dto/update-bus.dto';
 import { CreateBusTripDto } from './dto/create-bus-trip.dto';
@@ -56,6 +59,7 @@ export class TransitController {
     private readonly favoriteTransitRouteService: FavoriteTransitRouteService,
     private readonly appSettings: AppSettingsService,
     private readonly valhallaService: ValhallaService,
+    private readonly adminDashboardService: AdminDashboardService,
   ) {}
 
   // ─── Admin: global transit mode ───────────────────────────────────────────
@@ -66,6 +70,18 @@ export class TransitController {
   @Get('admin/settings/mode')
   getMode() {
     return { mode: this.appSettings.getMode() };
+  }
+
+  /**
+   * One-shot snapshot for the admin dashboard's overview cards.
+   * `?period=day|week|month|year` (default `day`) scopes the in-period
+   * trip and route counts; the current-state counts are always live.
+   */
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
+  @Get('admin/dashboard')
+  getDashboard(@Query() query: DashboardQueryDto) {
+    return this.adminDashboardService.getDashboard(query.period);
   }
 
   /**
@@ -87,17 +103,27 @@ export class TransitController {
       return { mode: dto.mode, changed: false };
     }
 
+    // Flip the flag first so downstream services see the new mode.
     await this.appSettings.setMode(dto.mode);
 
-    if (dto.mode === TransitMode.LIVE) {
-      this.busSimulationService.stop();
-      const cancelled = await this.busDispatchService.cancelAllActiveTrips();
-      return { mode: dto.mode, changed: true, ...cancelled };
+    try {
+      if (dto.mode === TransitMode.LIVE) {
+        this.busSimulationService.stop();
+        const cancelled = await this.busDispatchService.cancelAllActiveTrips();
+        return { mode: dto.mode, changed: true, ...cancelled };
+      }
+      // simulation
+      await this.busSimulationService.start();
+      return { mode: dto.mode, changed: true };
+    } catch (err) {
+      // The mode flag is already flipped but the side-effect failed —
+      // revert so the flag reflects reality. Then surface a 503 so the
+      // admin can retry rather than assuming the flip succeeded.
+      await this.appSettings.setMode(previous);
+      throw new ServiceUnavailableException(
+        `Failed to apply mode change; reverted to ${previous}. Original error: ${(err as Error).message}`,
+      );
     }
-
-    // simulation
-    await this.busSimulationService.start();
-    return { mode: dto.mode, changed: true };
   }
 
   // ─── Route Planning ────────────────────────────────────────
@@ -116,7 +142,23 @@ export class TransitController {
       [query.originLng, query.originLat],
       [query.destLng, query.destLat],
       query.type,
+      query.language,
+      query.preferRouteIds,
     );
+  }
+
+  /**
+   * Fresh ETA for a specific (trip, stop) pair — typically the user's alight
+   * stop. Lets the client refresh its on-bus ETA after it stops polling
+   * GET /transit/plan on a timer (route-tracking model). Cheap: reads the live
+   * position and walks the route's stop list, no plan re-solve.
+   *
+   * GET /transit/eta?tripId=<tripId>&stopId=<stopId>
+   * → { tripId, stopId, etaSeconds, atStop }
+   */
+  @Get('eta')
+  getEta(@Query('tripId') tripId: string, @Query('stopId') stopId: string) {
+    return this.busTripService.getEtaToStop(tripId, stopId);
   }
 
   // ─── Bus Location (Live Tracking) ─────────────────────────────────
@@ -184,10 +226,11 @@ export class TransitController {
   /**
    * Bulk-create stops on a route from a sequence of map clicks. If `routeId`
    * is omitted a fresh BusRoute is created from the metadata fields; if it's
-   * provided the stops are appended after the existing tail. Every non-first
-   * stop must include a manually-drawn `segmentFromPrevious` polyline; the
-   * backend stores it verbatim (no snapping). Use `/admin/suggest-path` to
-   * pre-fill a draft polyline if the admin wants Valhalla's suggestion.
+   * provided the stops are appended after the existing tail.
+   *
+   * Segment geometry per non-first stop: provide `segmentFromPrevious`
+   * (verbatim, from suggest-path) OR omit it and the backend computes the
+   * road path via Valhalla — optionally steered through the item's `vias`.
    */
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN)
@@ -195,25 +238,33 @@ export class TransitController {
   async bulkCreateRouteStops(@Body() dto: BulkBusRouteStopsDto) {
     const result = await this.busRouteStopService.bulkUpsert(dto);
     await this.transitRoutingService.invalidateNetworkCache();
+    this.busSimulationService.evictRoute(result.routeId);
     return result;
   }
 
   /**
-   * Pre-fill helper for the admin's manual-draw tool. Returns Valhalla's
-   * road-snapped polyline between two coords using `costing=auto`. The
-   * frontend uses this to seed the drawing — the admin can accept, edit, or
-   * discard — but the bulk endpoint never calls Valhalla itself.
+   * Preview helper for the admin's route editor. Returns Valhalla's
+   * road-snapped polyline between two coords using `costing=auto`,
+   * optionally forced through `vias` — points the admin drops on the
+   * specific road the bus takes when the default road is wrong. The admin
+   * accepts the preview and the frontend submits it verbatim.
+   *
+   * POST /transit/admin/suggest-path
+   * { from: [lng,lat], to: [lng,lat], vias?: [[lng,lat], ...] }
    */
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN)
-  @Get('admin/suggest-path')
-  async suggestPath(@Query() query: SuggestPathDto) {
+  @Post('admin/suggest-path')
+  async suggestPath(@Body() dto: SuggestPathDto) {
     const result = await this.valhallaService.getAutoPath(
-      [query.fromLng, query.fromLat],
-      [query.toLng, query.toLat],
+      dto.from,
+      dto.to,
+      dto.vias ?? [],
     );
     if (!result) {
-      throw new ForbiddenException('Valhalla could not route between points');
+      throw new ServiceUnavailableException(
+        'Valhalla could not route between the given points',
+      );
     }
     return {
       coordinates: result.path,
@@ -226,6 +277,7 @@ export class TransitController {
   async createRouteStop(@Body() dto: CreateBusRouteStopDto) {
     const result = await this.busRouteStopService.create(dto);
     await this.transitRoutingService.invalidateNetworkCache();
+    this.busSimulationService.evictRoute(dto.route.toString());
     return result;
   }
 
@@ -246,6 +298,12 @@ export class TransitController {
     return this.busRouteStopService.findOne(new Types.ObjectId(id));
   }
 
+  /**
+   * Fix a single stop: send `vias` (recompute the incoming segment through
+   * them) or `waypoints` (verbatim replacement polyline), or a new `stop`
+   * place (both adjacent segments recomputed). stopOrder/route changes are
+   * rejected — delete + re-create instead.
+   */
   @Patch('route-stops/:id')
   async updateRouteStop(
     @Param('id') id: string,
@@ -256,15 +314,24 @@ export class TransitController {
       dto,
     );
     await this.transitRoutingService.invalidateNetworkCache();
+    if (result.route) {
+      this.busSimulationService.evictRoute(String(result.route));
+    }
     return result;
   }
 
+  /**
+   * Delete one stop and heal the chain: the next stop's segment is
+   * recomputed from the previous stop directly, and later stopOrders are
+   * shifted down to close the hole.
+   */
   @Delete('route-stops/:id')
   async removeRouteStop(@Param('id') id: string) {
     const result = await this.busRouteStopService.remove(
       new Types.ObjectId(id),
     );
     await this.transitRoutingService.invalidateNetworkCache();
+    this.busSimulationService.evictRoute(result.routeId);
     return result;
   }
 

@@ -15,6 +15,22 @@ export class BusRoute extends BaseEntity {
   @Prop({ type: String, default: null })
   name?: string | null;
 
+  @Prop({ type: String, default: null })
+  color?: string | null;
+
+  /**
+   * Direction of travel for bidirectional routes that share a `code`.
+   * Null for circular/loop routes (`isLine: true`), where direction is
+   * meaningless. Routes pair up: (code: "5A", direction: "outbound") and
+   * (code: "5A", direction: "inbound") together describe the full Line 5A.
+   */
+  @Prop({
+    type: String,
+    enum: ['outbound', 'inbound'],
+    default: null,
+  })
+  direction?: 'outbound' | 'inbound' | null;
+
   @Prop({
     required: true,
     type: String,
@@ -35,3 +51,4 @@ export class BusRoute extends BaseEntity {
 export const BusRouteSchema = SchemaFactory.createForClass(BusRoute);
 BusRouteSchema.index({ isLine: 1 });
 BusRouteSchema.index({ code: 1 }, { sparse: true });
+BusRouteSchema.index({ code: 1, direction: 1 }, { sparse: true });
