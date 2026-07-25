@@ -22,7 +22,7 @@ export const TRANSFER_PENALTY_MIN = 1;
  * Catchability buffer (minutes): a bus is only catchable if it arrives at least
  * this many minutes AFTER the user reaches the stop. Spec: 1-minute buffer.
  */
-export const MIN_WAIT_MIN = 1;
+export const MIN_WAIT_MIN = 0;
 
 /**
  * Extra catchability buffer applied ONLY at transfer boardings (round > 1).
