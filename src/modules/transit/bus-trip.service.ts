@@ -15,6 +15,7 @@ import { BusTrip, BusTripDocument } from './entities/bus-trip.schema';
 import { CreateBusTripDto } from './dto/create-bus-trip.dto';
 import { UpdateBusTripDto } from './dto/update-bus-trip.dto';
 import { BusRouteStopService } from './bus-route-stop.service';
+import { BusRouteStop } from './entities/bus-route-stop.schema';
 import { BusLocationService } from './bus-location.service';
 import { RedisService } from '../../shared/redis/redis.service';
 import { haversineMeters } from '../../shared/helpers/helper-functions';
@@ -105,9 +106,37 @@ export class BusTripService {
     await this.busLocationService.clearLocation(tripId);
   }
 
-  private async mergeLiveData(trip: any, live: TripLiveData | null) {
+  /**
+   * Per-request memo for `findByRoute`. List endpoints merge many trips that
+   * share only a handful of routes (101 active trips over 30 routes at time of
+   * writing), and each `findByRoute` is a populated Atlas round trip. Without
+   * this the list rebuilt identical stop lists ~70 extra times and blew past
+   * the app's 10s client timeout, so the map silently rendered no buses.
+   * Scoped to one call — never a long-lived cache, so edits stay visible.
+   */
+  private async getRouteStopsCached(
+    routeId: Types.ObjectId,
+    cache?: Map<string, Promise<BusRouteStop[]>>,
+  ): Promise<BusRouteStop[]> {
+    if (!cache) return this.busRouteStopService.findByRoute(routeId);
+    const key = routeId?.toString() ?? '';
+    // Memoise the promise, not the result, so trips merged concurrently by
+    // Promise.all share one in-flight query instead of racing duplicates.
+    let pending = cache.get(key);
+    if (!pending) {
+      pending = this.busRouteStopService.findByRoute(routeId);
+      cache.set(key, pending);
+    }
+    return pending;
+  }
+
+  private async mergeLiveData(
+    trip: any,
+    live: TripLiveData | null,
+    routeStopsCache?: Map<string, Promise<BusRouteStop[]>>,
+  ) {
     const routeId = trip.route?._id || trip.route;
-    const stops = await this.busRouteStopService.findByRoute(routeId);
+    const stops = await this.getRouteStopsCached(routeId, routeStopsCache);
 
     const nextStop =
       (live && stops[live.nextStopIndex]
@@ -199,10 +228,11 @@ export class BusTripService {
       .populate('bus')
       .lean()
       .exec();
+    const routeStopsCache = new Map<string, Promise<BusRouteStop[]>>();
     return Promise.all(
       trips.map(async (trip) => {
         const live = await this.getLiveData(trip._id.toString());
-        return this.mergeLiveData(trip, live);
+        return this.mergeLiveData(trip, live, routeStopsCache);
       }),
     );
   }
@@ -214,10 +244,11 @@ export class BusTripService {
       .populate('bus')
       .lean()
       .exec();
+    const routeStopsCache = new Map<string, Promise<BusRouteStop[]>>();
     return Promise.all(
       trips.map(async (trip) => {
         const live = await this.getLiveData(trip._id.toString());
-        return await this.mergeLiveData(trip, live);
+        return await this.mergeLiveData(trip, live, routeStopsCache);
       }),
     );
   }

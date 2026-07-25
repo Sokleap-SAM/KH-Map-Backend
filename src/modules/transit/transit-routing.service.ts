@@ -825,9 +825,7 @@ export class TransitRoutingService {
 
       if (!routeStopsMap.has(routeId)) routeStopsMap.set(routeId, []);
       const segPath = (s as any).segmentPath as
-        | { coordinates: [number, number][] }
-        | null
-        | undefined;
+        { coordinates: [number, number][] } | null | undefined;
       const roadDistanceFromPrevious =
         segPath?.coordinates && segPath.coordinates.length >= 2
           ? sumSegmentPathDistance(segPath.coordinates)
