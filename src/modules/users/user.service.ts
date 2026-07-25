@@ -250,22 +250,6 @@ export class UsersService {
       );
     }
 
-    if (!user.isVerified) {
-      // Auto-trigger a code resend for their convenience
-      try {
-        const otp = Math.floor(100000 + Math.random() * 900000).toString();
-        await this.redis.set(`verify_otp:${cleanEmail}`, otp, 'EX', 900);
-        await this.mailerService.sendMail({
-          to: cleanEmail,
-          subject: 'លេខកូដផ្ទៀងផ្ទាត់គណនី - KH-Map',
-          text: `លេខកូដផ្ទៀងផ្ទាត់របស់អ្នកគឺ: ${otp}`,
-        });
-      } catch (e) {
-        console.error('Failed to send login unverified OTP code:', e);
-      }
-      throw new UnauthorizedException('UNVERIFIED_ACCOUNT');
-    }
-
     const payload = {
       sub: user._id,
       email: user.email,
