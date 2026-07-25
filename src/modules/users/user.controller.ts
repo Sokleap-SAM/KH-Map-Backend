@@ -50,6 +50,29 @@ export class UsersController {
     return this.usersService.create(createUserDto);
   }
 
+  @Post('verify')
+  async verify(@Body('email') email: string, @Body('otp') otp: string) {
+    return this.usersService.verifyRegistration(email, otp);
+  }
+
+  @Post('resend-code')
+  async resendCode(@Body('email') email: string) {
+    return this.usersService.resendVerificationCode(email);
+  }
+
+  @Post('google-login')
+  async googleLogin(@Body('idToken') idToken: string) {
+    return this.usersService.googleLogin(idToken);
+  }
+
+  // One-click sign-in: frontend sends the Firebase ID token it obtained from
+  // the Firebase client SDK; we verify it, provision the user, and return our
+  // own { access_token, user }.
+  @Post('firebase-login')
+  async firebaseLogin(@Body('idToken') idToken: string) {
+    return this.usersService.firebaseLogin(idToken);
+  }
+
   @Post('login')
   async login(@Body() loginDto: LoginDto) {
     return this.usersService.login(loginDto);

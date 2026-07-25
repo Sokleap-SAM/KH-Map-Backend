@@ -143,7 +143,22 @@ export class TransitController {
       [query.destLng, query.destLat],
       query.type,
       query.language,
+      query.preferRouteIds,
     );
+  }
+
+  /**
+   * Fresh ETA for a specific (trip, stop) pair — typically the user's alight
+   * stop. Lets the client refresh its on-bus ETA after it stops polling
+   * GET /transit/plan on a timer (route-tracking model). Cheap: reads the live
+   * position and walks the route's stop list, no plan re-solve.
+   *
+   * GET /transit/eta?tripId=<tripId>&stopId=<stopId>
+   * → { tripId, stopId, etaSeconds, atStop }
+   */
+  @Get('eta')
+  getEta(@Query('tripId') tripId: string, @Query('stopId') stopId: string) {
+    return this.busTripService.getEtaToStop(tripId, stopId);
   }
 
   // ─── Bus Location (Live Tracking) ─────────────────────────────────

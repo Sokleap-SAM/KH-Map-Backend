@@ -16,8 +16,17 @@ export class User extends BaseEntity {
   @Prop({ required: true, unique: true })
   email!: string;
 
-  @Prop({ required: true })
-  password!: string;
+  @Prop({ required: false, default: null })
+  password?: string;
+
+  @Prop({ type: String, default: null })
+  googleId?: string | null;
+
+  @Prop({ type: String, default: null, unique: true, sparse: true })
+  firebaseUid?: string | null;
+
+  @Prop({ type: Boolean, default: false })
+  isVerified!: boolean;
 
   @Prop({
     type: String,

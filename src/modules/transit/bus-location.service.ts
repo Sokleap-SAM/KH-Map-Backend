@@ -58,6 +58,45 @@ export class BusLocationService {
   async reportLocation(dto: ReportBusLocationDto): Promise<BusLocation | null> {
     const now = new Date();
 
+    const previousLocationRaw = await this.redisService.get(
+      tripKey(dto.tripId),
+    );
+    let calculatedHeading = dto.heading ?? 0;
+    if (previousLocationRaw) {
+      try {
+        // Cast or parse the raw cache hit safely into an object structure TypeScript understands
+        const prev = (
+          typeof previousLocationRaw === 'string'
+            ? JSON.parse(previousLocationRaw)
+            : previousLocationRaw
+        ) as Record<string, any> | null;
+
+        if (
+          prev &&
+          typeof prev.latitude === 'number' &&
+          typeof prev.longitude === 'number'
+        ) {
+          // Only calculate if the bus actually changed coordinates to prevent flickering at stops
+          if (
+            prev.latitude !== dto.latitude ||
+            prev.longitude !== dto.longitude
+          ) {
+            calculatedHeading = calculateBearing(
+              prev.latitude,
+              prev.longitude,
+              dto.latitude,
+              dto.longitude,
+            );
+          } else {
+            calculatedHeading =
+              typeof prev.heading === 'number' ? prev.heading : 0;
+          }
+        }
+      } catch (e) {
+        console.error('Failed to calculate live bearing alignment:', e);
+      }
+    }
+
     // Redis is updated on EVERY call — live ETAs and the route geo set
     // depend on this being fresh. Redis writes are cheap and bounded
     // by their TTL, so no throttle needed here.
@@ -67,7 +106,7 @@ export class BusLocationService {
       busId: dto.busId,
       longitude: dto.longitude,
       latitude: dto.latitude,
-      heading: dto.heading ?? null,
+      heading: calculatedHeading,
       speed: dto.speed ?? null,
       recordedAt: now.toISOString(),
       currentStopIndex: dto.currentStopIndex,
@@ -116,7 +155,7 @@ export class BusLocationService {
             type: 'Point',
             coordinates: [dto.longitude, dto.latitude],
           },
-          heading: dto.heading ?? null,
+          heading: calculatedHeading,
           speed: dto.speed ?? null,
           recordedAt: now,
         },
@@ -218,4 +257,22 @@ export class BusLocationService {
     // Filter out any entries whose TTL has already expired
     return results.filter((r): r is LiveBusPosition => r !== null);
   }
+}
+function calculateBearing(
+  lat1: number,
+  lon1: number,
+  lat2: number,
+  lon2: number,
+): number {
+  const dLon = (lon2 - lon1) * (Math.PI / 180);
+  const lat1Rad = lat1 * (Math.PI / 180);
+  const lat2Rad = lat2 * (Math.PI / 180);
+
+  const y = Math.sin(dLon) * Math.cos(lat2Rad);
+  const x =
+    Math.cos(lat1Rad) * Math.sin(lat2Rad) -
+    Math.sin(lat1Rad) * Math.cos(lat2Rad) * Math.cos(dLon);
+
+  const brng = Math.atan2(y, x) * (180 / Math.PI);
+  return (brng + 360) % 360; // Returns a clean 0 to 360 degree compass bearing
 }

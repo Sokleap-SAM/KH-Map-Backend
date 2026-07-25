@@ -7,6 +7,7 @@ import {
   Injectable,
   NotFoundException,
   BadRequestException,
+  Logger,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
@@ -18,7 +19,11 @@ import { BusRouteStop } from './entities/bus-route-stop.schema';
 import { BusLocationService } from './bus-location.service';
 import { RedisService } from '../../shared/redis/redis.service';
 import { haversineMeters } from '../../shared/helpers/helper-functions';
-import { BUS_SIMULATION_SPEED_KMH } from '../../shared/constants/constants';
+import {
+  BUS_SIMULATION_SPEED_KMH,
+  BUS_ROUTING_SPEED_KMH,
+  DWELL_TIME_MIN,
+} from '../../shared/constants/constants';
 
 // Redis key conventions:
 //   trip:live:{tripId}  → Hash { currentStopIndex, nextStopIndex, passengerCount, lng, lat }
@@ -35,6 +40,7 @@ export interface TripLiveData {
   latitude: number;
   heading: number;
   busImage: string;
+  mirrored: boolean;
 }
 
 @Injectable()
@@ -63,6 +69,7 @@ export class BusTripService {
       latitude: String(data.latitude),
       heading: String(data.heading || 0),
       busImage: data.busImage || 'bus_go_right.png',
+      mirrored: String(data.mirrored || false),
     });
     // Refresh TTL on every write so abandoned trips eventually expire
     await this.redisService.expire(key, TRIP_LIVE_TTL_SECONDS);
@@ -85,6 +92,7 @@ export class BusTripService {
       latitude: Number(data.latitude),
       heading: Number(data.heading || 0),
       busImage: data.busImage || 'bus_go_right.png',
+      mirrored: data.mirrored === 'true',
     };
   }
 
@@ -190,10 +198,27 @@ export class BusTripService {
       latitude: lat,
       heading: 0,
       busImage: 'bus_go_right.png',
+      mirrored: false,
     });
 
     const live = await this.getLiveData(tripId);
     return this.mergeLiveData(trip.toObject(), live);
+  }
+
+  private getIsometricBusImage(heading: number): string {
+    // Normalize angle to handle negative numbers or wraps safely
+    const angle = ((heading % 360) + 360) % 360;
+
+    // Map to your 4 specific isometric asset files
+    if (angle >= 0 && angle < 90) {
+      return 'bus_up_right.png';
+    } else if (angle >= 90 && angle < 180) {
+      return 'bus_down_right.png';
+    } else if (angle >= 180 && angle < 270) {
+      return 'bus_down_left.png';
+    } else {
+      return 'bus_up_left.png';
+    }
   }
 
   async findAll() {
@@ -277,9 +302,12 @@ export class BusTripService {
     ) {
       const newLng =
         dto.currentLocation?.coordinates[0] ?? currentLive?.longitude ?? 0;
-      const busImage = this.calculateBusDirection(
-        currentLive?.longitude ?? newLng,
-        newLng,
+      // Use the live heading value (defaulting to 0 if not set)
+      const currentHeading = currentLive?.heading ?? 0;
+      const busImage = this.getIsometricBusImage(currentHeading);
+      const logger = new Logger(BusTripService.name);
+      logger.log(
+        `Updating live data for trip ${tripId}: lng=${newLng}, heading=${currentHeading}, busImage=${busImage}`,
       );
 
       const updatedLive: TripLiveData = {
@@ -290,8 +318,9 @@ export class BusTripService {
         longitude: newLng,
         latitude:
           dto.currentLocation?.coordinates[1] ?? currentLive?.latitude ?? 0,
-        heading: 0,
+        heading: currentHeading,
         busImage: busImage,
+        mirrored: false,
       };
       await this.setLiveData(tripId, updatedLive);
     }
@@ -497,6 +526,117 @@ export class BusTripService {
       etaMinutes: Math.max(0, Math.round(etaSeconds / 60)),
       notDepartingUntilMs: pos.notDepartingUntilMs,
       isDwelling,
+    };
+  }
+
+  /**
+   * Fresh ETA for a SPECIFIC target stop on the trip's route, keyed by
+   * tripId + stopId. Where getEtaToNextStop only answers for the immediate
+   * next stop, this answers for any stop ahead — the frontend uses it to
+   * refresh the "arrive at your alight stop in N min" value once it stops
+   * polling GET /transit/plan on a timer (see the route-tracking model).
+   *
+   * Cheap by design: reads the one live position and walks the route's stop
+   * list. No plan re-solve.
+   *
+   * ETA composition mirrors buildTripDetail / the planner's segTime so the
+   * number agrees with the per-trip detail topic and the plan response:
+   *   - current pos → next stop: haversine / BUS_SIMULATION_SPEED_KMH
+   *   - subsequent hops: segment distance / BUS_ROUTING_SPEED_KMH + dwell
+   * A parked bus's remaining queue wait (notDepartingUntilMs) is added on top.
+   *
+   * `atStop` is true when the bus is currently at the target stop. A target
+   * the bus has already passed returns etaSeconds 0 with atStop false — the
+   * client reads that as "behind / missed".
+   */
+  async getEtaToStop(
+    tripId: string,
+    stopId: string,
+  ): Promise<{
+    tripId: string;
+    stopId: string;
+    etaSeconds: number;
+    atStop: boolean;
+  }> {
+    if (!tripId || !stopId) {
+      throw new BadRequestException('tripId and stopId are required.');
+    }
+
+    const pos = await this.busLocationService.getLivePosition(tripId);
+    if (!pos) {
+      throw new NotFoundException(`Trip ${tripId} has no live position yet.`);
+    }
+
+    const stops = await this.busRouteStopService.findByRoute(
+      new Types.ObjectId(pos.routeId),
+    );
+    if (stops.length === 0) {
+      throw new NotFoundException(
+        `Trip ${tripId} route has no stops configured.`,
+      );
+    }
+
+    const targetIdx = stops.findIndex(
+      (s) => (s.stop as any)._id.toString() === stopId,
+    );
+    if (targetIdx === -1) {
+      throw new NotFoundException(
+        `Stop ${stopId} is not on trip ${tripId}'s route.`,
+      );
+    }
+
+    const currentIdx = pos.currentStopIndex ?? 0;
+
+    // Bus is sitting at the target stop right now.
+    if (targetIdx === currentIdx) {
+      return { tripId, stopId, etaSeconds: 0, atStop: true };
+    }
+    // Target already passed — nothing left to wait for.
+    if (targetIdx < currentIdx) {
+      return { tripId, stopId, etaSeconds: 0, atStop: false };
+    }
+
+    const speedKmh =
+      pos.speed && pos.speed > 1 ? pos.speed : BUS_SIMULATION_SPEED_KMH;
+
+    // Parked bus: add the remaining queue wait before it departs.
+    const queueWaitSeconds =
+      pos.notDepartingUntilMs && pos.notDepartingUntilMs > Date.now()
+        ? (pos.notDepartingUntilMs - Date.now()) / 1000
+        : 0;
+
+    // Leg 1: current position → the immediate next stop (matches the map ETA).
+    const nextIdx = currentIdx + 1;
+    const nextCoords = (stops[nextIdx].stop as any).location.coordinates as [
+      number,
+      number,
+    ];
+    let etaSeconds =
+      (haversineMeters([pos.longitude, pos.latitude], nextCoords) /
+        (speedKmh * 1000)) *
+      3600;
+
+    // Legs 2..N: subsequent hops at routing speed + per-stop dwell, matching
+    // the planner's segTime so this ETA agrees with plan/detail figures.
+    for (let i = nextIdx + 1; i <= targetIdx; i++) {
+      const prevCoords = (stops[i - 1].stop as any).location.coordinates as [
+        number,
+        number,
+      ];
+      const currCoords = (stops[i].stop as any).location.coordinates as [
+        number,
+        number,
+      ];
+      const segDist = haversineMeters(prevCoords, currCoords);
+      etaSeconds +=
+        (segDist / (BUS_ROUTING_SPEED_KMH * 1000)) * 3600 + DWELL_TIME_MIN * 60;
+    }
+
+    return {
+      tripId,
+      stopId,
+      etaSeconds: Math.max(0, Math.round(etaSeconds + queueWaitSeconds)),
+      atStop: false,
     };
   }
 }

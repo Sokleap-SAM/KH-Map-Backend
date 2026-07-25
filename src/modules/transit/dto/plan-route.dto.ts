@@ -1,10 +1,13 @@
+/* eslint-disable @typescript-eslint/no-unsafe-return */
 /* eslint-disable @typescript-eslint/no-unsafe-argument */
 import { Transform } from 'class-transformer';
 import {
+  IsArray,
   IsEnum,
   IsNumber,
   IsNotEmpty,
   IsOptional,
+  IsString,
   Min,
   Max,
 } from 'class-validator';
@@ -63,4 +66,27 @@ export class PlanRouteDto {
   @IsOptional()
   @IsEnum(Language)
   language?: Language = Language.KHMER;
+
+  /**
+   * Optional ranking bias for triggered (mid-trip) re-plans: a comma-separated
+   * list of route ids the user is already committed to (e.g. `preferRouteIds=r1,r2`).
+   * Options whose bus legs use these routes get a ranking bonus so an off-route
+   * re-plan keeps the user on their journey where reasonable, instead of
+   * snapping to a different "fastest". Purely a tie-breaker nudge — it never
+   * resurrects an option the solver didn't already find. Omit for normal plans.
+   * The transform splits the CSV and drops blanks; an already-array value
+   * (repeated query param) is passed through.
+   */
+  @IsOptional()
+  @Transform(({ value }) =>
+    typeof value === 'string'
+      ? value
+          .split(',')
+          .map((v: string) => v.trim())
+          .filter((v: string) => v.length > 0)
+      : value,
+  )
+  @IsArray()
+  @IsString({ each: true })
+  preferRouteIds?: string[];
 }
