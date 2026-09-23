@@ -22,7 +22,10 @@ export class User extends BaseEntity {
   @Prop({ type: String, default: null })
   googleId?: string | null;
 
-  @Prop({ type: String, default: null, unique: true, sparse: true })
+  // Deliberately no `default: null` — a sparse unique index skips documents
+  // where the field is ABSENT, not ones where it is null. Defaulting to null
+  // would make every non-Firebase user collide on the same key.
+  @Prop({ type: String, unique: true, sparse: true, required: false })
   firebaseUid?: string | null;
 
   @Prop({ type: Boolean, default: false })

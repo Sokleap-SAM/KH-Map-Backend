@@ -12,6 +12,7 @@ import {
   Inject,
   Injectable,
   NotFoundException,
+  OnModuleInit,
   UnauthorizedException,
 } from '@nestjs/common';
 import * as bcrypt from 'bcryptjs';
@@ -28,7 +29,7 @@ import { initializeApp, getApps } from 'firebase-admin/app';
 import { getAuth, DecodedIdToken } from 'firebase-admin/auth';
 
 @Injectable()
-export class UsersService {
+export class UsersService implements OnModuleInit {
   constructor(
     @InjectModel(User.name) private userModel: Model<UserDocument>,
     @InjectModel(Bus.name) private busModel: Model<BusDocument>,
@@ -42,6 +43,23 @@ export class UsersService {
     private readonly mailerService: MailerService,
     private jwtService: JwtService,
   ) {}
+
+  /**
+   * Drop the pre-#31 `firebaseUid_1` index, which was created while the field
+   * still defaulted to null and so is NOT sparse. Mongoose leaves an existing
+   * index alone when the schema's spec changes, so without this every account
+   * created without a Firebase UID would collide on `firebaseUid: null` with
+   * an E11000 duplicate-key error. The sparse index is then rebuilt from the
+   * schema. Safe to keep permanently — a no-op once the index is gone.
+   */
+  async onModuleInit() {
+    try {
+      await this.userModel.collection.dropIndex('firebaseUid_1');
+      console.log('Successfully dropped old firebaseUid index');
+    } catch {
+      // Index already dropped or never existed — nothing to do.
+    }
+  }
 
   async create(userData: CreateUserDto) {
     const cleanEmail = userData.email.trim().toLowerCase();
