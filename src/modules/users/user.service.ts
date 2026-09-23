@@ -542,4 +542,13 @@ export class UsersService {
     await this.redis.del(redisKey);
     return { message: 'Success' };
   }
+  async onModuleInit() {
+    try {
+      await this.userModel.collection.dropIndex('firebaseUid_1');
+      console.log('Successfully dropped old firebaseUid index');
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    } catch (e) {
+      // Index already dropped or doesn't exist
+    }
+  }
 }

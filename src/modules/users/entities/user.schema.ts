@@ -22,7 +22,7 @@ export class User extends BaseEntity {
   @Prop({ type: String, default: null })
   googleId?: string | null;
 
-  @Prop({ type: String, default: null, unique: true, sparse: true })
+  @Prop({ type: String, unique: true, sparse: true, required: false })
   firebaseUid?: string | null;
 
   @Prop({ type: Boolean, default: false })
