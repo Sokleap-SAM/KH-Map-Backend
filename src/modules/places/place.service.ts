@@ -58,23 +58,6 @@ export class PlaceService {
       .exec();
   }
 
-  async createStop(
-    dto: CreatePlaceDto,
-    files?: Express.Multer.File[],
-  ): Promise<Place> {
-    const stopCatId = await this.getStopCategoryId();
-    const photos = files?.map((file) => (file as CloudinaryFile).path) ?? [];
-    const location = { type: 'Point' as const, coordinates: dto.location };
-    // Override whatever category the caller sent — stops always belong to the
-    // canonical "Bus Stop" category.
-    return this.placeModel.create({
-      ...dto,
-      category: stopCatId,
-      location,
-      photos,
-    });
-  }
-
   async countStops(): Promise<number> {
     const stopCatId = await this.getStopCategoryId();
     return this.placeModel.countDocuments({ category: stopCatId }).exec();

@@ -113,9 +113,27 @@ export class DriverService {
     const password = await this.usersService.rotateMqttPassword(
       new Types.ObjectId(driverId),
     );
+    // Protocol is explicit rather than inferred, because a hosted broker is
+    // reached over TLS on a different port than the plaintext dev broker and
+    // the app must not have to guess. Port defaults track the protocol so a
+    // TLS deployment that forgets MQTT_BROKER_PUBLIC_PORT still lands on 8883
+    // instead of silently offering the plaintext port.
+    const protocol =
+      this.config.get<string>('MQTT_BROKER_PUBLIC_PROTOCOL') ?? 'mqtt';
+    const secure = protocol === 'mqtts' || protocol === 'wss';
+    const host =
+      this.config.get<string>('MQTT_BROKER_PUBLIC_HOST') ?? 'localhost';
+    const port = Number(
+      this.config.get<string>('MQTT_BROKER_PUBLIC_PORT') ??
+        (secure ? 8883 : 1883),
+    );
+
     return {
-      host: this.config.get<string>('MQTT_BROKER_PUBLIC_HOST') ?? 'localhost',
-      port: Number(this.config.get<string>('MQTT_BROKER_PUBLIC_PORT') ?? 1883),
+      protocol,
+      host,
+      port,
+      /** Ready-to-use connection string; host/port are kept for older clients. */
+      url: `${protocol}://${host}:${port}`,
       username: driverId,
       password,
       publishTopic: `driver/${driverId}/location`,

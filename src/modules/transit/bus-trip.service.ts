@@ -344,40 +344,6 @@ export class BusTripService {
     return this.update(id, { status: 'in-progress' });
   }
 
-  async advanceToNextStop(id: Types.ObjectId) {
-    const trip = await this.busTripModel.findById(id).populate('route').exec();
-    if (!trip)
-      throw new NotFoundException(`BusTrip ${id.toString()} not found`);
-
-    const tripId = id.toString();
-    const live = await this.getLiveData(tripId);
-    if (!live)
-      throw new BadRequestException(
-        `No live data found for trip ${tripId}. The trip may have expired from Redis.`,
-      );
-    const nextIndex = live.nextStopIndex;
-
-    const stops = await this.busRouteStopService.findByRoute(trip.route._id);
-
-    if (nextIndex >= stops.length) {
-      return this.update(id, { status: 'completed' });
-    }
-
-    const nextStop = stops[nextIndex];
-    const populatedStop = nextStop.stop as unknown as {
-      location: { type: string; coordinates: [number, number] };
-    };
-
-    return this.update(id, {
-      currentStopIndex: nextIndex,
-      nextStopIndex: nextIndex + 1,
-      currentLocation: {
-        type: 'Point',
-        coordinates: populatedStop.location.coordinates,
-      },
-    });
-  }
-
   async findNearby(
     longitude: number,
     latitude: number,
@@ -457,9 +423,7 @@ export class BusTripService {
   }> {
     const pos = await this.busLocationService.getLivePosition(tripId);
     if (!pos) {
-      throw new NotFoundException(
-        `Trip ${tripId} has no live position yet.`,
-      );
+      throw new NotFoundException(`Trip ${tripId} has no live position yet.`);
     }
 
     const stops = await this.busRouteStopService.findByRoute(

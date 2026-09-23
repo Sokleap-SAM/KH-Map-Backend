@@ -4,7 +4,6 @@ import {
   appConfig,
   databaseConfig,
   redisConfig,
-  mapConfig,
   mqttConfig,
   envValidationSchema,
 } from './config';
@@ -23,7 +22,7 @@ import { FavoritesModule } from './modules/favorites/favorites.module';
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
-      load: [appConfig, databaseConfig, redisConfig, mapConfig, mqttConfig],
+      load: [appConfig, databaseConfig, redisConfig, mqttConfig],
       validationSchema: envValidationSchema,
     }),
     DatabaseModule,

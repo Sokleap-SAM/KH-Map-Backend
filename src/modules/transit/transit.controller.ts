@@ -273,6 +273,8 @@ export class TransitController {
     };
   }
 
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
   @Post('route-stops')
   async createRouteStop(@Body() dto: CreateBusRouteStopDto) {
     const result = await this.busRouteStopService.create(dto);
@@ -304,6 +306,8 @@ export class TransitController {
    * place (both adjacent segments recomputed). stopOrder/route changes are
    * rejected — delete + re-create instead.
    */
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
   @Patch('route-stops/:id')
   async updateRouteStop(
     @Param('id') id: string,
@@ -325,6 +329,8 @@ export class TransitController {
    * recomputed from the previous stop directly, and later stopOrders are
    * shifted down to close the hole.
    */
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
   @Delete('route-stops/:id')
   async removeRouteStop(@Param('id') id: string) {
     const result = await this.busRouteStopService.remove(
@@ -337,6 +343,8 @@ export class TransitController {
 
   // ─── Buses ─────────────────────────────────────────────────
 
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
   @Post('buses')
   createBus(@Body() dto: CreateBusDto) {
     return this.busService.create(dto);
@@ -352,11 +360,15 @@ export class TransitController {
     return this.busService.findOne(new Types.ObjectId(id));
   }
 
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
   @Patch('buses/:id')
   updateBus(@Param('id') id: string, @Body() dto: UpdateBusDto) {
     return this.busService.update(new Types.ObjectId(id), dto);
   }
 
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
   @Delete('buses/:id')
   removeBus(@Param('id') id: string) {
     return this.busService.remove(new Types.ObjectId(id));
@@ -364,6 +376,8 @@ export class TransitController {
 
   // ─── Trips (Simulation) ───────────────────────────────────
 
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
   @Post('trips')
   createTrip(@Body() dto: CreateBusTripDto) {
     return this.busTripService.create(dto);
@@ -409,21 +423,15 @@ export class TransitController {
     return this.busTripService.getEtaToNextStop(id);
   }
 
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
   @Patch('trips/:id')
   updateTrip(@Param('id') id: string, @Body() dto: UpdateBusTripDto) {
     return this.busTripService.update(new Types.ObjectId(id), dto);
   }
 
-  @Post('trips/:id/start')
-  startTrip(@Param('id') id: string) {
-    return this.busTripService.startTrip(new Types.ObjectId(id));
-  }
-
-  @Post('trips/:id/advance')
-  advanceTrip(@Param('id') id: string) {
-    return this.busTripService.advanceToNextStop(new Types.ObjectId(id));
-  }
-
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
   @Delete('trips/:id')
   removeTrip(@Param('id') id: string) {
     return this.busTripService.remove(new Types.ObjectId(id));
@@ -437,6 +445,8 @@ export class TransitController {
    *
    * GET /transit/simulation/status
    */
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
   @Get('simulation/status')
   async getSimulationStatus() {
     const activeTrips = await this.busTripService.findActive();
@@ -451,6 +461,8 @@ export class TransitController {
    *
    * POST /transit/simulation/start
    */
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
   @Post('simulation/start')
   async startSimulation() {
     await this.busSimulationService.start();
@@ -462,6 +474,8 @@ export class TransitController {
    *
    * POST /transit/simulation/stop
    */
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
   @Post('simulation/stop')
   stopSimulation() {
     this.busSimulationService.stop();
@@ -477,6 +491,8 @@ export class TransitController {
    *
    * POST /transit/favorites
    */
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.USER)
   @Post('favorites')
   createFavorite(@Body() dto: CreateFavoriteTransitRouteDto) {
     return this.favoriteTransitRouteService.create(dto);
@@ -487,6 +503,8 @@ export class TransitController {
    *
    * GET /transit/favorites?user=<userId>
    */
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.USER)
   @Get('favorites')
   listFavorites(@Query('user') userId: string) {
     return this.favoriteTransitRouteService.findByUser(
@@ -501,11 +519,15 @@ export class TransitController {
    *
    * GET /transit/favorites/:id
    */
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.USER)
   @Get('favorites/:id')
   getFavorite(@Param('id') id: string) {
     return this.favoriteTransitRouteService.findOne(new Types.ObjectId(id));
   }
 
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.USER)
   @Delete('favorites/:id')
   removeFavorite(@Param('id') id: string) {
     return this.favoriteTransitRouteService.remove(new Types.ObjectId(id));
@@ -524,6 +546,8 @@ export class TransitController {
    *
    * POST /transit/dispatch/reset
    */
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
   @Post('dispatch/reset')
   async resetDispatch() {
     if (process.env.NODE_ENV === 'production') {

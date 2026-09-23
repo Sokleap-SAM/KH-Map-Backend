@@ -53,6 +53,8 @@ export class PlaceController {
     private readonly ratingService: PlaceRatingService,
   ) {}
 
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
   @Post('categories')
   @UseInterceptors(AnyFilesInterceptor())
   createCategory(@Body() dto: CreatePlaceCategoryDto) {
@@ -69,6 +71,8 @@ export class PlaceController {
     return this.categoryService.findOne(new Types.ObjectId(categoryId));
   }
 
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
   @Patch('categories/:categoryId')
   @UseInterceptors(AnyFilesInterceptor())
   updateCategory(
@@ -78,6 +82,8 @@ export class PlaceController {
     return this.categoryService.update(new Types.ObjectId(categoryId), dto);
   }
 
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
   @Delete('categories/:categoryId')
   removeCategory(@Param('categoryId') categoryId: string) {
     return this.categoryService.remove(new Types.ObjectId(categoryId));
@@ -93,15 +99,6 @@ export class PlaceController {
     return this.placeService.findAllStops();
   }
 
-  @Post('stops')
-  @UseInterceptors(FilesInterceptor('photos', 10, { storage: placeStorage }))
-  createStop(
-    @Body() dto: CreatePlaceDto,
-    @UploadedFiles() files?: Express.Multer.File[],
-  ) {
-    return this.placeService.createStop(dto, files);
-  }
-
   // ─── Place requests (user submission → admin approval) ─────────────────────
   // Declared before the generic `:id` routes so the literal `requests` path
   // segment is matched first.
@@ -109,6 +106,7 @@ export class PlaceController {
   /** Any logged-in user submits a new place — held as PENDING for review. */
   @Post('requests')
   @UseGuards(JwtAuthGuard)
+  @Roles(UserRole.USER)
   @UseInterceptors(FilesInterceptor('photos', 10, { storage: placeStorage }))
   createRequest(
     @Req() req: AuthenticatedRequest,
@@ -141,6 +139,7 @@ export class PlaceController {
   /** The caller's own submitted requests (all statuses), for status feedback. */
   @Get('requests/mine')
   @UseGuards(JwtAuthGuard)
+  @Roles(UserRole.USER)
   findMyRequests(@Req() req: AuthenticatedRequest) {
     return this.placeService.findByCreator(new Types.ObjectId(req.user.userId));
   }
@@ -211,6 +210,8 @@ export class PlaceController {
     return this.placeService.findOne(new Types.ObjectId(id));
   }
 
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
   @Patch(':id')
   @UseInterceptors(FilesInterceptor('photos', 10, { storage: placeStorage }))
   update(
@@ -221,6 +222,8 @@ export class PlaceController {
     return this.placeService.update(new Types.ObjectId(id), dto, files);
   }
 
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
   @Delete(':id')
   remove(@Param('id') id: string) {
     return this.placeService.remove(new Types.ObjectId(id));
@@ -234,6 +237,7 @@ export class PlaceController {
    */
   @Get('ratings/mine')
   @UseGuards(JwtAuthGuard)
+  @Roles(UserRole.USER)
   findMyRatings(@Req() req: AuthenticatedRequest) {
     return this.ratingService.findAllByUser(
       new Types.ObjectId(req.user.userId),
@@ -242,6 +246,7 @@ export class PlaceController {
 
   @Post(':placeId/ratings')
   @UseGuards(JwtAuthGuard)
+  @Roles(UserRole.USER)
   @UseInterceptors(FilesInterceptor('photos', 10, { storage: ratingStorage }))
   createRating(
     @Req() req: AuthenticatedRequest,
@@ -265,6 +270,8 @@ export class PlaceController {
   }
 
   @Patch(':placeId/ratings/:ratingId')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.USER)
   @UseInterceptors(AnyFilesInterceptor())
   updateRating(
     @Param('ratingId') ratingId: string,
@@ -273,6 +280,9 @@ export class PlaceController {
     return this.ratingService.update(new Types.ObjectId(ratingId), dto);
   }
 
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.USER, UserRole.ADMIN)
+  @UseInterceptors(AnyFilesInterceptor())
   @Delete(':placeId/ratings/:ratingId')
   removeRating(@Param('ratingId') ratingId: string) {
     return this.ratingService.remove(new Types.ObjectId(ratingId));

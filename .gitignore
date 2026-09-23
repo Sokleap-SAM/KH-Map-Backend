@@ -36,7 +36,12 @@ lerna-debug.log*
 !.vscode/extensions.json
 
 # dotenv environment variable files
+# Ignore every .env variant, then re-allow the committed template. The broad
+# pattern matters: `.env.production` holds real credentials and was not covered
+# by the narrower `.env.production.local` rule below it.
 .env
+.env.*
+!.env.example
 .env.development.local
 .env.test.local
 .env.production.local

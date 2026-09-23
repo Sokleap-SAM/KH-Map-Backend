@@ -1,6 +1,7 @@
 import { MongooseModule } from '@nestjs/mongoose';
 import { User, UserSchema } from './entities/user.schema';
 import { Bus, BusSchema } from '../transit/entities/bus.schema';
+import { BusTrip, BusTripSchema } from '../transit/entities/bus-trip.schema';
 import { Module } from '@nestjs/common';
 import { UsersController } from './user.controller';
 import { UsersService } from './user.service';
@@ -16,6 +17,10 @@ import { MailerModule } from '@nestjs-modules/mailer';
     MongooseModule.forFeature([
       { name: User.name, schema: UserSchema },
       { name: Bus.name, schema: BusSchema },
+      // Registering the schema directly rather than importing TransitModule —
+      // TransitModule imports this one, so that would be circular. Used only to
+      // block deleting a driver who has a trip in progress.
+      { name: BusTrip.name, schema: BusTripSchema },
     ]),
     PassportModule.register({ defaultStrategy: 'jwt' }),
     MailerModule.forRootAsync({
