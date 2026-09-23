@@ -5,6 +5,7 @@ import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { User, UserDocument } from './entities/user.schema';
 import { Bus, BusDocument } from '../transit/entities/bus.schema';
+import { BusTrip, BusTripDocument } from '../transit/entities/bus-trip.schema';
 import {
   BadRequestException,
   ConflictException,
@@ -31,6 +32,12 @@ export class UsersService {
   constructor(
     @InjectModel(User.name) private userModel: Model<UserDocument>,
     @InjectModel(Bus.name) private busModel: Model<BusDocument>,
+    // Only used to refuse deleting a driver who is mid-trip. Registered via
+    // MongooseModule.forFeature in UsersModule, so this pulls in the schema
+    // without importing TransitModule — which imports UsersModule and would
+    // make the dependency circular.
+    @InjectModel(BusTrip.name)
+    private busTripModel: Model<BusTripDocument>,
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
     private readonly mailerService: MailerService,
     private jwtService: JwtService,
@@ -150,6 +157,7 @@ export class UsersService {
   //   - bus doesn't exist
   //   - bus is already assigned to a different driver (admin must unassign
   //     the previous driver first — explicit is safer than implicit reassign)
+  //   - either side has a trip in progress (see the guards below)
   async assignBusToDriver(
     driverId: Types.ObjectId,
     busId: Types.ObjectId | null,
@@ -161,6 +169,53 @@ export class UsersService {
     }
 
     const previousBusId = driver.assignedBusId;
+
+    // Is this call actually changing anything? Re-assigning a driver to the bus
+    // they already have is a no-op and shouldn't trip the guards below.
+    const changesAssignment =
+      (previousBusId?.toString() ?? null) !== (busId?.toString() ?? null);
+
+    if (changesAssignment) {
+      // Guard 1 — the driver is mid-trip.
+      //
+      // Location publishes are resolved per message as
+      // driver -> assignedBusId -> in-progress trip on that bus. Moving the
+      // driver now would silently redirect their GPS to a different trip while
+      // the one they are physically driving stops updating and goes stale until
+      // its Redis TTL expires.
+      const driverActiveTrip = await this.busTripModel
+        .findOne({ driver: driverId, status: 'in-progress' })
+        .exec();
+      if (driverActiveTrip) {
+        throw new ConflictException(
+          'Driver has a trip in progress — cancel it before reassigning',
+        );
+      }
+
+      // Guard 2 — the target bus is mid-trip under someone else.
+      //
+      // Only trips with a driver stamped count: in simulation mode the
+      // dispatcher runs trips with `driver: null`, and blocking assignment on
+      // those would make it impossible to onboard a driver onto a simulated
+      // fleet.
+      if (busId) {
+        const busActiveTrip = await this.busTripModel
+          .findOne({
+            bus: busId,
+            status: 'in-progress',
+            driver: { $ne: null },
+          })
+          .exec();
+        if (
+          busActiveTrip &&
+          busActiveTrip.driver?.toString() !== driverId.toString()
+        ) {
+          throw new ConflictException(
+            'That bus has a trip in progress under another driver — cancel it first',
+          );
+        }
+      }
+    }
 
     if (busId === null) {
       driver.assignedBusId = null;
@@ -541,5 +596,259 @@ export class UsersService {
 
     await this.redis.del(redisKey);
     return { message: 'Success' };
+  }
+
+  // ─── CRUD ──────────────────────────────────────────────────────────────────
+
+  /**
+   * Strip credential fields before a user document leaves the service. Every
+   * CRUD method below returns through this — `password` and `mqttPasswordHash`
+   * are bcrypt hashes, and hashes are still worth brute-forcing offline.
+   */
+  private sanitize(user: UserDocument) {
+    const obj = user.toObject() as unknown as Record<string, unknown>;
+    delete obj.password;
+    delete obj.mqttPasswordHash;
+    return obj;
+  }
+
+  /** Fields excluded from list/read queries — the projection form of sanitize. */
+  private static readonly PUBLIC_PROJECTION = '-password -mqttPasswordHash';
+
+  /**
+   * Admin-created account. Skips the email OTP that `create()` requires:
+   * `isVerified` is true from the start, so a driver can be onboarded and log
+   * in without waiting on a mailbox.
+   */
+  async adminCreate(dto: {
+    name: string;
+    email: string;
+    password: string;
+    role?: UserRole;
+  }) {
+    const cleanEmail = dto.email.trim().toLowerCase();
+
+    const existing = await this.userModel.findOne({ email: cleanEmail }).exec();
+    if (existing) {
+      throw new ConflictException('Email already registered');
+    }
+
+    const salt = await bcrypt.genSalt();
+    const user = new this.userModel({
+      name: dto.name,
+      email: cleanEmail,
+      password: await bcrypt.hash(dto.password, salt),
+      role: dto.role ?? UserRole.USER,
+      status: UserStatus.OFF,
+      assignedBusId: null,
+      isVerified: true,
+    });
+    await user.save();
+    return this.sanitize(user);
+  }
+
+  /**
+   * Paginated user list for the admin dashboard. Without this an admin has no
+   * way to discover the `:id` that every other admin endpoint requires.
+   */
+  async findAll(query: {
+    page?: number;
+    limit?: number;
+    role?: UserRole;
+    status?: UserStatus;
+    search?: string;
+  }) {
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 20;
+
+    const filter: Record<string, unknown> = {};
+    if (query.role) filter.role = query.role;
+    if (query.status) filter.status = query.status;
+    if (query.search) {
+      // Escape regex metacharacters — an unescaped search box is a trivial
+      // ReDoS, and a lone "(" would otherwise throw on an invalid pattern.
+      const safe = query.search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      filter.$or = [
+        { name: { $regex: safe, $options: 'i' } },
+        { email: { $regex: safe, $options: 'i' } },
+      ];
+    }
+
+    const [data, total] = await Promise.all([
+      this.userModel
+        .find(filter)
+        .select(UsersService.PUBLIC_PROJECTION)
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .exec(),
+      this.userModel.countDocuments(filter).exec(),
+    ]);
+
+    return {
+      data,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit) || 1,
+    };
+  }
+
+  /** Single user, credentials stripped. */
+  async findOnePublic(userId: Types.ObjectId) {
+    const user = await this.userModel
+      .findById(userId)
+      .select(UsersService.PUBLIC_PROJECTION)
+      .exec();
+    if (!user) throw new NotFoundException('User not found');
+    return user;
+  }
+
+  /**
+   * Admin edit. Only the fields present in `dto` are touched.
+   *
+   * A role change routes through the same demotion logic as `setRole` — an
+   * ex-driver must not keep a bus link, on either side of the relationship.
+   */
+  async adminUpdate(
+    userId: Types.ObjectId,
+    dto: {
+      name?: string;
+      email?: string;
+      password?: string;
+      role?: UserRole;
+      status?: UserStatus;
+      isVerified?: boolean;
+    },
+  ) {
+    const user = await this.userModel.findById(userId).exec();
+    if (!user) throw new NotFoundException('User not found');
+
+    if (dto.email !== undefined) {
+      const cleanEmail = dto.email.trim().toLowerCase();
+      if (cleanEmail !== user.email) {
+        const taken = await this.userModel
+          .findOne({ email: cleanEmail, _id: { $ne: userId } })
+          .exec();
+        if (taken) throw new ConflictException('Email already registered');
+        user.email = cleanEmail;
+      }
+    }
+
+    if (dto.name !== undefined) user.name = dto.name;
+    if (dto.isVerified !== undefined) user.isVerified = dto.isVerified;
+    if (dto.status !== undefined) user.status = dto.status;
+
+    if (dto.password !== undefined) {
+      const salt = await bcrypt.genSalt();
+      user.password = await bcrypt.hash(dto.password, salt);
+    }
+
+    if (dto.role !== undefined && dto.role !== user.role) {
+      const wasDriver = user.role === UserRole.DRIVER;
+      const previousBusId = user.assignedBusId;
+      user.role = dto.role;
+
+      if (wasDriver && dto.role !== UserRole.DRIVER) {
+        user.assignedBusId = null;
+        user.status = UserStatus.OFF;
+        if (previousBusId) {
+          await this.busModel
+            .updateOne({ _id: previousBusId }, { assignedDriverId: null })
+            .exec();
+        }
+      }
+    }
+
+    await user.save();
+    return this.sanitize(user);
+  }
+
+  /**
+   * Self-service profile edit. Narrower than the admin path by design — a user
+   * cannot change their own role, status, or email here.
+   *
+   * Changing the password requires the current one, so a stolen JWT alone
+   * can't be used to lock the real owner out of their account.
+   */
+  async updateOwnProfile(
+    userId: Types.ObjectId,
+    dto: { name?: string; currentPassword?: string; newPassword?: string },
+  ) {
+    const user = await this.userModel.findById(userId).exec();
+    if (!user) throw new NotFoundException('User not found');
+
+    if (dto.name !== undefined) user.name = dto.name;
+
+    if (dto.newPassword !== undefined) {
+      if (!user.password) {
+        // Google/Firebase accounts were provisioned without one, so there is
+        // nothing to verify against. They set a first password through the
+        // forgot-password flow, which proves control of the mailbox instead.
+        throw new BadRequestException(
+          'This account has no password set — use forgot-password instead',
+        );
+      }
+      const ok = await bcrypt.compare(dto.currentPassword ?? '', user.password);
+      if (!ok) throw new UnauthorizedException('Current password is incorrect');
+
+      const salt = await bcrypt.genSalt();
+      user.password = await bcrypt.hash(dto.newPassword, salt);
+    }
+
+    await user.save();
+    return this.sanitize(user);
+  }
+
+  /**
+   * Hard delete. Three guards, each protecting against a state you cannot
+   * recover from through the API:
+   *
+   *   1. An admin cannot delete themselves (immediate self-lockout).
+   *   2. The last admin cannot be deleted (nobody could administer anything).
+   *   3. A driver mid-trip is refused — cancel the trip first. Deleting them
+   *      would leave an in-progress trip whose driver no longer exists, with a
+   *      bus that stops reporting and no way to close it out.
+   *
+   * A deleted driver's finished trips keep their `driver` ObjectId, so history
+   * stays intact; populating it simply yields null.
+   */
+  async remove(userId: Types.ObjectId, actingAdminId: string) {
+    if (userId.toString() === actingAdminId) {
+      throw new BadRequestException('You cannot delete your own account');
+    }
+
+    const user = await this.userModel.findById(userId).exec();
+    if (!user) throw new NotFoundException('User not found');
+
+    if (user.role === UserRole.ADMIN) {
+      const admins = await this.userModel
+        .countDocuments({ role: UserRole.ADMIN })
+        .exec();
+      if (admins <= 1) {
+        throw new ConflictException(
+          'Cannot delete the last admin — promote another user first',
+        );
+      }
+    }
+
+    if (user.role === UserRole.DRIVER) {
+      const activeTrip = await this.busTripModel
+        .findOne({ driver: userId, status: 'in-progress' })
+        .exec();
+      if (activeTrip) {
+        throw new ConflictException(
+          'Driver has a trip in progress — cancel it before deleting',
+        );
+      }
+      if (user.assignedBusId) {
+        await this.busModel
+          .updateOne({ _id: user.assignedBusId }, { assignedDriverId: null })
+          .exec();
+      }
+    }
+
+    await this.userModel.deleteOne({ _id: userId }).exec();
+    return { message: 'User deleted', id: userId.toString() };
   }
 }

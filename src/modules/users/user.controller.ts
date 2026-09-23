@@ -6,6 +6,8 @@ import {
   Get,
   Param,
   Patch,
+  Delete,
+  Query,
   Request as Req,
 } from '@nestjs/common';
 import { Request } from 'express';
@@ -19,6 +21,10 @@ import { UserRole } from './enums/role.enum';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { SetRoleDto } from './dto/set-role.dto';
 import { AssignBusDto } from './dto/assign-bus.dto';
+import { AdminCreateUserDto } from './dto/admin-create-user.dto';
+import { AdminUpdateUserDto } from './dto/admin-update-user.dto';
+import { UpdateProfileDto } from './dto/update-profile.dto';
+import { ListUsersQueryDto } from './dto/list-users-query.dto';
 
 interface AuthenticatedRequest extends Request {
   user: {
@@ -36,11 +42,22 @@ export class UsersController {
     return { message: 'Welcome, Boss. Here is your money' };
   }
 
-  @UseGuards(JwtAuthGuard, RolesGuard)
-  @Roles(UserRole.USER, UserRole.ADMIN)
+  /**
+   * The caller's own profile, read fresh from the database.
+   *
+   * Previously this returned `req.user` — the decoded JWT payload — so it could
+   * not report `status`, `assignedBusId`, `isVerified` or `createdAt`, and a
+   * role changed by an admin kept showing the old value until the user logged
+   * in again.
+   *
+   * Guarded by JwtAuthGuard alone: this is "my own profile", so every
+   * authenticated role qualifies. The previous `@Roles(USER, ADMIN)` excluded
+   * drivers from reading their own record.
+   */
+  @UseGuards(JwtAuthGuard)
   @Get('profile')
   getProfile(@Req() req: AuthenticatedRequest) {
-    return req.user;
+    return this.usersService.findOnePublic(new Types.ObjectId(req.user.userId));
   }
 
   constructor(private readonly usersService: UsersService) {}
@@ -115,5 +132,92 @@ export class UsersController {
       new Types.ObjectId(id),
       dto.busId ? new Types.ObjectId(dto.busId) : null,
     );
+  }
+
+  // ─── CRUD ─────────────────────────────────────────────────────────────────
+  //
+  // Route order matters here. Nest matches in declaration order, so the literal
+  // paths ('me', and 'profile'/'admin-dashboard' at the top of this class) must
+  // be declared before `:id` — otherwise `GET /users/profile` would be captured
+  // by `GET /users/:id` and try to look up a user with the id "profile".
+
+  /**
+   * Update your own profile. Deliberately narrow: name and password only.
+   * Role, status and email are not self-editable — see UpdateProfileDto.
+   */
+  @UseGuards(JwtAuthGuard)
+  @Patch('me')
+  updateOwnProfile(
+    @Req() req: AuthenticatedRequest,
+    @Body() dto: UpdateProfileDto,
+  ) {
+    return this.usersService.updateOwnProfile(
+      new Types.ObjectId(req.user.userId),
+      dto,
+    );
+  }
+
+  /**
+   * Create a user directly, already verified — the onboarding path for drivers,
+   * who would otherwise have to self-register, wait for an OTP email, and then
+   * be promoted in a second call.
+   *
+   * POST /users/admin
+   */
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
+  @Post('admin')
+  adminCreateUser(@Body() dto: AdminCreateUserDto) {
+    return this.usersService.adminCreate(dto);
+  }
+
+  /**
+   * Paginated user list, filterable by role and status and searchable by name
+   * or email. Without this an admin has no way to discover the ids that every
+   * other admin endpoint takes.
+   *
+   * GET /users?page=1&limit=20&role=driver&search=sok
+   */
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
+  @Get()
+  listUsers(@Query() query: ListUsersQueryDto) {
+    return this.usersService.findAll(query);
+  }
+
+  /** GET /users/:id */
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
+  @Get(':id')
+  findOneUser(@Param('id') id: string) {
+    return this.usersService.findOnePublic(new Types.ObjectId(id));
+  }
+
+  /**
+   * Admin edit of any user. A role change here runs the same demotion logic as
+   * the dedicated role endpoint, so an ex-driver's bus link is cleared on both
+   * sides rather than left dangling.
+   *
+   * PATCH /users/:id
+   */
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
+  @Patch(':id')
+  adminUpdateUser(@Param('id') id: string, @Body() dto: AdminUpdateUserDto) {
+    return this.usersService.adminUpdate(new Types.ObjectId(id), dto);
+  }
+
+  /**
+   * Delete a user. Refuses to delete yourself, the last remaining admin, or a
+   * driver with a trip in progress — each of those leaves a state you cannot
+   * recover from through the API.
+   *
+   * DELETE /users/:id
+   */
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(UserRole.ADMIN)
+  @Delete(':id')
+  removeUser(@Req() req: AuthenticatedRequest, @Param('id') id: string) {
+    return this.usersService.remove(new Types.ObjectId(id), req.user.userId);
   }
 }

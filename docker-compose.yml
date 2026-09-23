@@ -17,6 +17,8 @@ services:
         condition: service_healthy
       mqtt:
         condition: service_started
+      valhalla:
+        condition: service_healthy
     networks:
       - bus_net
 
@@ -37,7 +39,6 @@ services:
     image: redis:alpine
     container_name: bus_redis
     command: redis-server --requirepass ${REDIS_PASSWORD}
-    # command: command: redis-server --requirepass ${REDIS_PASSWORD} --save ""
     ports:
       - "${REDIS_PORT}:6379"
     healthcheck:
@@ -54,34 +55,18 @@ services:
     ports:
       - "${VALHALLA_PORT}:8002"
     volumes:
-      # Persists built tiles so they survive container restarts.
-      # On first run, Valhalla will auto-build tiles from any .osm.pbf
-      # files it finds inside /custom_files. Drop your Cambodia PBF there.
-      # Download from: https://download.geofabrik.de/asia/cambodia-latest.osm.pbf
       - ./valhalla/custom_files:/custom_files
       - valhalla_tiles:/valhalla/tiles
     restart: unless-stopped
     environment:
-      # Worker threads per service. Defaults to $(nproc) inside the image
-      # (32 on this host), which spawns 32 workers for EACH of loki/thor/
-      # odin/meili/tyr. Every worker opens several ZMQ sockets, and a ZMQ
-      # context caps out at 1023 sockets -> zmq_socket() returns EMFILE and
-      # Valhalla dies with "Too many open files" right after loading tiles.
       - server_threads=4
-      # Build tiles automatically if none exist yet
       - tile_urls=
-      # Use the PBF files in /custom_files instead of downloading
       - use_tiles_ignore_pbf=False
       - force_rebuild=False
-      # Pedestrian-focused: keep all costing models but pedestrian is default
       - build_elevation=False
       - build_admins=True
       - build_time_zones=True
     healthcheck:
-      # Valhalla's /status endpoint returns 200 once tiles are ready.
-      # Must be curl — the image ships no wget, so the old probe always
-      # errored and the container sat permanently "unhealthy" while serving
-      # traffic perfectly well.
       test: ["CMD", "curl", "-fsS", "http://localhost:8002/status"]
       interval: 10s
       timeout: 5s

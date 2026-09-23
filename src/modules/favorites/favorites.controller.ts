@@ -12,6 +12,8 @@ import { Request } from 'express';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { FavoritesService } from './favorites.service';
 import { AddFavoriteDto } from './dto/add-favorite.dto';
+import { Roles } from 'src/common/decorators/roles.decorator';
+import { UserRole } from '../users/enums/role.enum';
 
 interface AuthenticatedRequest extends Request {
   user: {
@@ -22,6 +24,7 @@ interface AuthenticatedRequest extends Request {
 }
 
 @UseGuards(JwtAuthGuard)
+@Roles(UserRole.USER, UserRole.ADMIN)
 @Controller('favorites')
 export class FavoritesController {
   constructor(private readonly favoritesService: FavoritesService) {}
@@ -37,10 +40,7 @@ export class FavoritesController {
   }
 
   @Delete(':placeId')
-  remove(
-    @Req() req: AuthenticatedRequest,
-    @Param('placeId') placeId: string,
-  ) {
+  remove(@Req() req: AuthenticatedRequest, @Param('placeId') placeId: string) {
     return this.favoritesService.remove(req.user.userId, placeId);
   }
 
