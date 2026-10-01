@@ -40,10 +40,13 @@ import { MailerModule } from '@nestjs-modules/mailer';
         },
       }),
     }),
+    // JWT_SECRET is required by the env schema — no fallback here, and none in
+    // jwt.strategy.ts either. The two must always agree, and a default value
+    // would mean a missing env var silently signs tokens with a known key.
     JwtModule.registerAsync({
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
-        secret: config.get<string>('JWT_SECRET') || 'SUPER_SECRET_KEY',
+        secret: config.get<string>('JWT_SECRET')!,
         signOptions: { expiresIn: '1d' },
       }),
     }),

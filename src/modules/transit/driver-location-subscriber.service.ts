@@ -2,6 +2,7 @@ import { Injectable, OnModuleInit } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
 import { MqttService } from '../../shared/mqtt/mqtt.service';
+import { RedisService } from '../../shared/redis/redis.service';
 import { BusLocationService } from './bus-location.service';
 import { BusTripService } from './bus-trip.service';
 import { BusTrip, BusTripDocument } from './entities/bus-trip.schema';
@@ -31,10 +32,13 @@ interface DriverLocationPayload {
 
 @Injectable()
 export class DriverLocationSubscriberService implements OnModuleInit {
-  // Per-driver guard against out-of-order and too-frequent publishes. Kept
-  // in-process — single source of truth is fine because driver auth pins
-  // each driver to one MQTT session at a time.
+  // Per-driver guard against out-of-order publishes. Safe in-process: every
+  // instance sees every message, so each keeps its own accurate high-water
+  // mark regardless of which instance wins the publish window below.
   private readonly lastSequenceByDriver = new Map<string, number>();
+
+  // Fallback rate guard, used ONLY while Redis is unreachable. The real
+  // cross-instance guard is claimPublishWindow().
   private readonly lastPublishAtByDriver = new Map<string, number>();
 
   constructor(
@@ -45,6 +49,7 @@ export class DriverLocationSubscriberService implements OnModuleInit {
     private readonly busTripService: BusTripService,
     private readonly usersService: UsersService,
     private readonly appSettings: AppSettingsService,
+    private readonly redis: RedisService,
   ) {}
 
   onModuleInit(): void {
@@ -66,8 +71,6 @@ export class DriverLocationSubscriberService implements OnModuleInit {
     if (!driverId) return;
 
     const now = Date.now();
-    const lastPub = this.lastPublishAtByDriver.get(driverId) ?? 0;
-    if (now - lastPub < MIN_PUBLISH_INTERVAL_MS) return;
 
     let data: DriverLocationPayload;
     try {
@@ -96,6 +99,16 @@ export class DriverLocationSubscriberService implements OnModuleInit {
       this.lastSequenceByDriver.set(driverId, data.sequence);
     }
 
+    // Cross-instance claim. Every API task subscribes to driver/+/location, so
+    // without a shared guard N tasks each run the driver lookup, the trip
+    // lookup, both Redis writes and the mirror publish for a single message.
+    // Whoever wins the claim does the work; the rest step aside.
+    //
+    // Placed after the cheap in-process checks, so a malformed or replayed
+    // publish doesn't burn a driver's window, but before the Mongo lookups,
+    // which are the expensive work being de-duplicated.
+    if (!(await this.claimPublishWindow(driverId, now))) return;
+
     // Driver state checks. Each one is independently required — a stale
     // credential should NOT be enough on its own.
     let driverObjId: Types.ObjectId;
@@ -118,8 +131,6 @@ export class DriverLocationSubscriberService implements OnModuleInit {
     const tripId = trip._id.toString();
     const busId = driver.assignedBusId.toString();
     const routeId = trip.route.toString();
-
-    this.lastPublishAtByDriver.set(driverId, now);
 
     // Persist live position into BOTH Redis layers the simulator writes to:
     //   1. BusLocationService — used by routing for live ETAs
@@ -171,6 +182,30 @@ export class DriverLocationSubscriberService implements OnModuleInit {
       },
       { qos: 0, retain: true },
     );
+  }
+
+  /**
+   * Claim this driver's publish window. False means another instance — or this
+   * one — already handled a publish from them inside MIN_PUBLISH_INTERVAL_MS.
+   *
+   * Falls back to the in-process map when Redis is down, preserving the old
+   * single-instance behaviour instead of dropping every location update.
+   */
+  private async claimPublishWindow(
+    driverId: string,
+    now: number,
+  ): Promise<boolean> {
+    if (this.redis.isReady()) {
+      return this.redis.setnxPx(
+        `driver-pub:${driverId}`,
+        '1',
+        MIN_PUBLISH_INTERVAL_MS,
+      );
+    }
+    const last = this.lastPublishAtByDriver.get(driverId) ?? 0;
+    if (now - last < MIN_PUBLISH_INTERVAL_MS) return false;
+    this.lastPublishAtByDriver.set(driverId, now);
+    return true;
   }
 }
 

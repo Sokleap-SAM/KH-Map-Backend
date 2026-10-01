@@ -17,6 +17,7 @@ import { SearchHistoryModule } from './modules/search-history/search-history.mod
 import { AppSettingsModule } from './modules/app-settings/app-settings.module';
 import { MqttAuthModule } from './modules/mqtt-auth/mqtt-auth.module';
 import { FavoritesModule } from './modules/favorites/favorites.module';
+import { HealthModule } from './modules/health/health.module';
 
 @Module({
   imports: [
@@ -27,6 +28,7 @@ import { FavoritesModule } from './modules/favorites/favorites.module';
     }),
     DatabaseModule,
     RedisModule,
+    HealthModule,
     MqttModule,
     AppSettingsModule,
     PlaceModule,

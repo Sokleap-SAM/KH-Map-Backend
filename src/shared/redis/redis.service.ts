@@ -148,7 +148,7 @@ export class RedisService {
     try {
       const result = await this.redisClient.geopos(key, member);
       if (!result || !result[0]) return null;
-      return result[0] as [string, string];
+      return result[0];
     } catch {
       return null;
     }
@@ -184,6 +184,29 @@ export class RedisService {
         value,
         'EX',
         ttlSeconds,
+        'NX',
+      );
+      return result === 'OK';
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Millisecond-precision variant of {@link setnx}. EX cannot express a
+   * sub-second window, and the driver publish throttle is 500 ms.
+   */
+  async setnxPx(
+    key: string,
+    value: string,
+    ttlMillis: number,
+  ): Promise<boolean> {
+    try {
+      const result = await this.redisClient.set(
+        key,
+        value,
+        'PX',
+        ttlMillis,
         'NX',
       );
       return result === 'OK';

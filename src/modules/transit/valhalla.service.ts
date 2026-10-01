@@ -85,11 +85,12 @@ export class ValhallaService {
   private readonly baseUrl: string;
 
   constructor(private readonly configService: ConfigService) {
-    const host = this.configService.get<string>(
-      'VALHALLA_HOST',
-      'bus_valhalla',
-    );
-    const port = this.configService.get<number>('VALHALLA_PORT', 8002);
+    // `||` rather than a get() default: an env var that is present but blank
+    // is not undefined, so the default would not apply and the base URL would
+    // come out as `http://:8002`. Production requires both explicitly.
+    const host =
+      this.configService.get<string>('VALHALLA_HOST') || 'bus_valhalla';
+    const port = this.configService.get<number>('VALHALLA_PORT') || 8002;
     this.baseUrl = `http://${host}:${port}`;
   }
 

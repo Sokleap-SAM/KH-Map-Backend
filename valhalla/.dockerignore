@@ -1,0 +1,8 @@
+# The PBF is a tile-build input, not a runtime artifact — 38 MB that would
+# otherwise be uploaded to the daemon on every build.
+custom_files/*.osm.pbf
+custom_files/*:Zone.Identifier
+# Superseded by valhalla_tiles.tar, which is what Valhalla actually serves.
+custom_files/valhalla_tiles/
+custom_files/duplicateways.txt
+custom_files/file_hashes.txt

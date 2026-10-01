@@ -1,0 +1,43 @@
+{
+  "family": "khmap-redis",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/khmapEcsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "redis",
+      "image": "redis:alpine",
+      "essential": true,
+      "portMappings": [
+        {
+          "name": "redis",
+          "containerPort": 6379,
+          "protocol": "tcp"
+        }
+      ],
+      "entryPoint": ["sh", "-c"],
+      "command": ["exec redis-server --requirepass \"$REDIS_PASSWORD\""],
+      "secrets": [
+        { "name": "REDIS_PASSWORD", "valueFrom": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:khmap/prod:REDIS_PASSWORD::" }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "redis-cli -a \"$REDIS_PASSWORD\" ping | grep -q PONG"],
+        "interval": 10,
+        "timeout": 3,
+        "retries": 5,
+        "startPeriod": 10
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/khmap-redis",
+          "awslogs-region": "<REGION>",
+          "awslogs-stream-prefix": "ecs",
+          "awslogs-create-group": "true"
+        }
+      }
+    }
+  ]
+}

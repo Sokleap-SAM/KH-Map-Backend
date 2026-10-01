@@ -42,9 +42,17 @@ export const mqttConfig = registerAs('mqtt', (): MqttConfig => ({
   url: process.env.MQTT_URL!,
   username: process.env.MQTT_USERNAME || undefined,
   password: process.env.MQTT_PASSWORD || undefined,
-  clientId:
-    process.env.MQTT_CLIENT_ID ||
-    `kh-map-api-${Math.random().toString(36).slice(2, 8)}`,
+  // MQTT_CLIENT_ID is a PREFIX, never the whole id — a random suffix is always
+  // appended. MQTT requires client ids to be unique per connection: when a
+  // client connects with an id already in use, the broker disconnects the
+  // existing one. Two API tasks sharing a fixed id therefore evict each other
+  // in a loop, reconnecting every few seconds and dropping the
+  // driver/+/location subscription each time, so live positions arrive only in
+  // bursts. The previous form used the env var verbatim when set, which made
+  // that failure a one-line change away in any multi-task deployment.
+  clientId: `${process.env.MQTT_CLIENT_ID || 'kh-map-api'}-${Math.random()
+    .toString(36)
+    .slice(2, 8)}`,
   keepalive: Number(process.env.MQTT_KEEPALIVE ?? 60),
   // Default true — only an explicit "false" opts out.
   rejectUnauthorized: process.env.MQTT_TLS_REJECT_UNAUTHORIZED !== 'false',
