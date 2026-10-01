@@ -14,6 +14,9 @@ lerna-debug.log*
 
 # OS
 .DS_Store
+# Windows "downloaded from the internet" marker, surfaced as a real file
+# through the WSL/UNC bridge.
+*Zone.Identifier
 
 # Tests
 /coverage
@@ -60,13 +63,25 @@ pids
 # Diagnostic reports (https://nodejs.org/api/report.html)
 report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 
-# Valhalla files
-/valhalla
+# Valhalla. The Dockerfile, tile-build script and valhalla.json MUST be
+# tracked or the image cannot be built from a clone. What stays out is the
+# large binaries: the OSM extract (an input) and the built graph, both
+# reproducible with valhalla/build-tiles.sh.
+valhalla/custom_files/*.osm.pbf
+valhalla/custom_files/*Zone.Identifier
+valhalla/custom_files/valhalla_tiles/
+valhalla/custom_files/valhalla_tiles.tar
+valhalla/custom_files/admin_data/
+valhalla/custom_files/timezone_data/
+valhalla/custom_files/duplicateways.txt
+valhalla/custom_files/file_hashes.txt
 
-# Library files
-package-lock.json
+# Library files. package-lock.json is deliberately NOT ignored: the
+# Dockerfile runs `npm ci`, which fails outright without a lockfile.
 yarn.lock
 pnpm-lock.yaml
 
-# MQTT
-/mosquitto
+# MQTT broker
+# Nothing here is ignored: the broker image is built from this directory
+# (Dockerfile, entrypoint, configs, ACL), so ignoring it meant a fresh clone
+# could not build the broker at all.

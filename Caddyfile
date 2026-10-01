@@ -1,0 +1,94 @@
+# Caddy fronts the whole stack. It is the only container with published
+# ports, and it obtains and renews Let's Encrypt certificates automatically —
+# both hostnames must already point at this EC2 instance's public IP before
+# the first boot, or the ACME challenge fails.
+#
+# Domains come from .env (API_DOMAIN / MQTT_DOMAIN) via docker-compose.prod.yml.
+
+# ─── REST API ────────────────────────────────────────────────────────────────
+{$API_DOMAIN} {
+	reverse_proxy api:3000
+
+	encode gzip
+
+	header {
+		# Force HTTPS for a year on any client that has visited once.
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	# The broker authenticates clients by POSTing to /internal/mqtt-auth/*.
+	# Those calls travel inside bus_net and must never be reachable from the
+	# internet: anyone who could reach them would be probing driver
+	# credentials directly against bcrypt.
+	handle /internal/* {
+		respond "Not found" 404
+	}
+
+	log {
+		output file /data/access-api.log {
+			roll_size 10MB
+			roll_keep 5
+		}
+	}
+}
+
+# ─── MQTT over WebSocket — riders ────────────────────────────────────────────
+# Rider apps connect here as wss://{$MQTT_DOMAIN}, anonymously. Mosquitto's
+# 9001 listener loads no auth plugin, which is the only way anonymous clients
+# can connect at all: mosquitto-go-auth rejects a null username in its C shim
+# before Go ever sees it, and denies rather than defers, so allow_anonymous is
+# never reached on a listener where the plugin is loaded.
+#
+# Read-only on transit/#, enforced by anonymous.acl.
+#
+# Using a dedicated subdomain rather than a path (e.g. /mqtt on the API host)
+# is deliberate: Mosquitto serves websockets at the root, so clients need no
+# path, and `issueMqttCredentials` can hand out `wss://host:443` unchanged.
+{$MQTT_DOMAIN} {
+	# reverse_proxy upgrades WebSocket connections automatically.
+	reverse_proxy mqtt:9001
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+
+	log {
+		output file /data/access-mqtt.log {
+			roll_size 10MB
+			roll_keep 5
+		}
+	}
+}
+
+# ─── MQTT over WebSocket — drivers ───────────────────────────────────────────
+# Drivers get a separate hostname because they need a separate listener: 9002
+# loads the auth plugin, so each driver is authenticated and pinned to
+# driver/<their-own-id>/location. They cannot share 9001 with riders, since
+# that listener has no plugin and would treat them as anonymous.
+#
+# A second hostname rather than a path on {$MQTT_DOMAIN}: an ALB cannot strip a
+# path prefix, so keeping the two shapes identical here and on AWS avoids a
+# Caddy-only arrangement that would not survive the move to ECS.
+#
+# The API hands this host to the driver app via MQTT_BROKER_PUBLIC_HOST, so
+# repointing apps is an env change, not a client release.
+{$MQTT_DRIVER_DOMAIN} {
+	reverse_proxy mqtt:9002
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+
+	log {
+		output file /data/access-mqtt-driver.log {
+			roll_size 10MB
+			roll_keep 5
+		}
+	}
+}

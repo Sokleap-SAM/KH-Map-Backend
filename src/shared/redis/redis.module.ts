@@ -11,16 +11,18 @@ import { RedisService, REDIS_CLIENT } from './redis.service';
       provide: REDIS_CLIENT,
       inject: [ConfigService],
       useFactory: (configService: ConfigService) => {
-        const { host, port, password } =
+        const { host, port, password, tls } =
           configService.get<RedisConfig>('redis')!;
         const client = new Redis({
           host,
           port,
           password,
+          // Driven by REDIS_TLS. See redis.config.ts for why this is explicit
+          // rather than inferred from the hostname.
+          tls: tls ? {} : undefined,
           // Fail fast when Redis is unreachable so HTTP handlers don't block
           // on the default 20-retry loop. RedisService catches the resulting
           // errors and returns safe defaults.
-          tls: host.includes('redis') ? undefined : {},
           maxRetriesPerRequest: 1,
           enableOfflineQueue: false,
           retryStrategy: (times) => Math.min(times * 1000, 30_000),

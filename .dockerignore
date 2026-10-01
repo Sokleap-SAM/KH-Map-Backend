@@ -1,5 +1,5 @@
 # Dependencies
-node_modules
+**/node_modules
 
 # Build output
 dist
@@ -33,7 +33,19 @@ Dockerfile
 docker-compose*.yml
 .dockerignore
 
+# Other services' build contexts. Each has its own Dockerfile and is built
+# separately, so none of this belongs in the API image. valhalla/custom_files
+# alone is ~250MB of tiles and OSM data — leaving it in made the API build
+# context 367MB and cost ~23s of upload on every build.
+valhalla
+mosquitto
+
+# Deploy assets — not needed to compile the app.
+deploy
+.github
+Caddyfile
+
 # Misc
-README.md
+*.md
 .prettierrc
 eslint.config.mjs

@@ -1,0 +1,72 @@
+{
+  "family": "khmap-api",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/khmapEcsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/khmapApiTaskRole",
+  "containerDefinitions": [
+    {
+      "name": "api",
+      "image": "<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/khmap-api:IMAGE_TAG",
+      "essential": true,
+      "portMappings": [
+        {
+          "name": "api",
+          "containerPort": 3000,
+          "protocol": "tcp",
+          "appProtocol": "http"
+        }
+      ],
+      "stopTimeout": 30,
+      "environment": [
+        { "name": "NODE_ENV", "value": "production" },
+        { "name": "CONTAINER_PORT", "value": "3000" },
+        { "name": "REDIS_HOST", "value": "redis.khmap.local" },
+        { "name": "REDIS_PORT", "value": "6379" },
+        { "name": "REDIS_TLS", "value": "false" },
+        { "name": "VALHALLA_HOST", "value": "valhalla.khmap.local" },
+        { "name": "VALHALLA_PORT", "value": "8002" },
+        { "name": "CORS_ORIGINS", "value": "*" },
+        { "name": "MQTT_URL", "value": "mqtt://mosquitto.khmap.local:1883" },
+        { "name": "MQTT_KEEPALIVE", "value": "60" },
+        { "name": "MQTT_BROKER_PUBLIC_PROTOCOL", "value": "wss" },
+        { "name": "MQTT_BROKER_PUBLIC_HOST", "value": "driver-mqtt.kh-map.online" },
+        { "name": "MQTT_BROKER_PUBLIC_PORT", "value": "443" },
+        { "name": "CLOUDINARY_CLOUD_NAME", "value": "drxyfiuot" },
+        { "name": "FIREBASE_PROJECT_ID", "value": "khmapauth" }
+      ],
+      "secrets": [
+        { "name": "MONGODB_URI", "valueFrom": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:khmap/prod:MONGODB_URI::" },
+        { "name": "JWT_SECRET", "valueFrom": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:khmap/prod:JWT_SECRET::" },
+        { "name": "EMAIL_USER", "valueFrom": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:khmap/prod:EMAIL_USER::" },
+        { "name": "EMAIL_PASS", "valueFrom": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:khmap/prod:EMAIL_PASS::" },
+        { "name": "REDIS_PASSWORD", "valueFrom": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:khmap/prod:REDIS_PASSWORD::" },
+        { "name": "CLOUDINARY_API_KEY", "valueFrom": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:khmap/prod:CLOUDINARY_API_KEY::" },
+        { "name": "CLOUDINARY_API_SECRET", "valueFrom": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:khmap/prod:CLOUDINARY_API_SECRET::" },
+        { "name": "MQTT_USERNAME", "valueFrom": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:khmap/prod:MQTT_USERNAME::" },
+        { "name": "MQTT_PASSWORD", "valueFrom": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:khmap/prod:MQTT_PASSWORD::" },
+        { "name": "MQTT_AUTH_INTERNAL_SECRET", "valueFrom": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:khmap/prod:MQTT_AUTH_INTERNAL_SECRET::" },
+        { "name": "MQTT_BACKEND_USERNAME", "valueFrom": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:khmap/prod:MQTT_BACKEND_USERNAME::" },
+        { "name": "MQTT_BACKEND_PASSWORD", "valueFrom": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:khmap/prod:MQTT_BACKEND_PASSWORD::" }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "node -e \"require('http').get('http://127.0.0.1:3000/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))\""],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 30
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/khmap-api",
+          "awslogs-region": "<REGION>",
+          "awslogs-stream-prefix": "ecs",
+          "awslogs-create-group": "true"
+        }
+      }
+    }
+  ]
+}

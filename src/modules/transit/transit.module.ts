@@ -27,7 +27,6 @@ import { TransitRoutingService } from './transit-routing.service';
 import { BusSimulationService } from './bus-simulation.service';
 import { BusDispatchService } from './bus-dispatch.service';
 import { FavoriteTransitRouteService } from './favorite-transit-route.service';
-import { OsrmService } from './osrm.service';
 import { ValhallaService } from './valhalla.service';
 import { AppSettingsModule } from '../app-settings/app-settings.module';
 import { UsersModule } from '../users/user.module';
@@ -64,7 +63,6 @@ import { AdminDashboardService } from './admin-dashboard.service';
     BusSimulationService,
     BusDispatchService,
     FavoriteTransitRouteService,
-    OsrmService,
     ValhallaService,
     DriverService,
     DriverLocationSubscriberService,
