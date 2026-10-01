@@ -1,0 +1,150 @@
+# Build and deploy to ECS.
+#
+# Builds the API and broker images; the Valhalla image is NOT built here. Its
+# tiles are ~220 MB of generated binaries that are deliberately gitignored, so
+# a CI checkout does not contain them. Valhalla is rebuilt by hand whenever the
+# OSM extract changes — see valhalla/build-tiles.sh and deploy/README.md.
+name: Deploy
+
+# Two jobs, two triggers:
+#
+#   pull_request into dev / beta / production  -> verify only, never deploys
+#   push to production (i.e. a merge landing)  -> verify, then deploy
+#
+# So a PR is typechecked BEFORE it merges, and only a merge into production
+# reaches ECS. Opening or updating a PR never deploys — `push` fires on the
+# merge commit, not on the PR.
+#
+# `main` is deliberately not a trigger: it is outside the
+# features/* -> dev -> beta -> production flow, and a push there would
+# otherwise deploy code that had skipped the earlier branches.
+#
+# There is currently one ECS environment, so beta has nothing to deploy TO.
+# When a staging cluster exists, add `beta` to the push trigger and parameterise
+# the cluster/service names rather than duplicating this file.
+on:
+  push:
+    branches: [production]
+  pull_request:
+    branches: [dev, beta, production]
+  workflow_dispatch:
+
+permissions:
+  id-token: write # for OIDC; no long-lived AWS keys in secrets
+  contents: read
+
+# Region and cluster name are not sensitive, so they live here. The account id
+# does not: this repo is public, so it comes from the AWS_ACCOUNT_ID secret and
+# is composed into the registry URL at job level.
+#
+# Note `secrets` is NOT available in a workflow-level env block — only at job or
+# step level. Putting ECR_REGISTRY here would silently resolve to an empty
+# account id and every push would fail with an unhelpful registry error.
+env:
+  AWS_REGION: ap-southeast-1
+  ECS_CLUSTER: khmap
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      mosquitto: ${{ steps.changes.outputs.mosquitto }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            mosquitto:
+              - 'mosquitto/**'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Typecheck
+        run: npx tsc --noEmit
+      # Non-blocking for now: src/ has pre-existing lint errors unrelated to
+      # the deploy work. Remove continue-on-error once those are cleared.
+      - name: Lint
+        run: npx eslint "src/**/*.ts"
+        continue-on-error: true
+      # Placeholder: there are no unit specs yet. Drop --passWithNoTests as
+      # soon as the first one lands, so a missing suite fails loudly.
+      - name: Test
+        run: npx jest --passWithNoTests
+
+  deploy:
+    needs: verify
+    # Push only. Without this, every PR into dev/beta/production would build
+    # images and update the live service — the exact opposite of a pre-merge
+    # check. workflow_dispatch is allowed so a deploy can be re-run by hand.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # Job level, not workflow level — this is where `secrets` is available.
+    env:
+      ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.ap-southeast-1.amazonaws.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/khmapGithubActionsRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push API image
+        run: |
+          docker build --target production \
+            -t "$ECR_REGISTRY/khmap-api:${{ github.sha }}" \
+            -t "$ECR_REGISTRY/khmap-api:latest" .
+          docker push "$ECR_REGISTRY/khmap-api:${{ github.sha }}"
+          docker push "$ECR_REGISTRY/khmap-api:latest"
+
+      # The broker image compiles a Go auth plugin, so it is slow. Only rebuild
+      # when something in mosquitto/ actually changed.
+      - name: Build and push broker image
+        if: needs.verify.outputs.mosquitto == 'true'
+        run: |
+          docker build \
+            -t "$ECR_REGISTRY/khmap-mosquitto:${{ github.sha }}" \
+            -t "$ECR_REGISTRY/khmap-mosquitto:latest" mosquitto/
+          docker push "$ECR_REGISTRY/khmap-mosquitto:${{ github.sha }}"
+          docker push "$ECR_REGISTRY/khmap-mosquitto:latest"
+
+      - name: Render API task definition
+        id: taskdef
+        run: |
+          sed -e "s|IMAGE_TAG|${{ github.sha }}|g" \
+              -e "s|<ACCOUNT_ID>|${{ secrets.AWS_ACCOUNT_ID }}|g" \
+              -e "s|<REGION>|$AWS_REGION|g" \
+              deploy/taskdef-api.json > /tmp/taskdef-api.json
+          echo "path=/tmp/taskdef-api.json" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy API service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.taskdef.outputs.path }}
+          service: khmap-api
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Render and deploy broker service
+        if: needs.verify.outputs.mosquitto == 'true'
+        run: |
+          sed -e "s|IMAGE_TAG|${{ github.sha }}|g" \
+              -e "s|<ACCOUNT_ID>|${{ secrets.AWS_ACCOUNT_ID }}|g" \
+              -e "s|<REGION>|$AWS_REGION|g" \
+              -e "s|<EFS_ID>|${{ secrets.EFS_ID }}|g" \
+              -e "s|<EFS_ACCESS_POINT_ID>|${{ secrets.EFS_ACCESS_POINT_ID }}|g" \
+              deploy/taskdef-mosquitto.json > /tmp/taskdef-mosquitto.json
+          arn=$(aws ecs register-task-definition \
+            --cli-input-json file:///tmp/taskdef-mosquitto.json \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          # maximum-percent 100 keeps this at exactly one task: a second broker
+          # would split session state and retained topics.
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service khmap-mosquitto \
+            --task-definition "$arn" \
+            --deployment-configuration maximumPercent=100,minimumHealthyPercent=0
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services khmap-mosquitto

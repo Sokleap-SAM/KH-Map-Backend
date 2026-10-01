@@ -1,0 +1,48 @@
+{
+  "family": "khmap-valhalla",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "2048",
+  "memory": "4096",
+  "executionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/khmapEcsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "valhalla",
+      "image": "<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/khmap-valhalla:IMAGE_TAG",
+      "essential": true,
+      "portMappings": [
+        {
+          "name": "valhalla",
+          "containerPort": 8002,
+          "protocol": "tcp",
+          "appProtocol": "http"
+        }
+      ],
+      "environment": [
+        { "name": "force_rebuild", "value": "False" },
+        { "name": "use_tiles_ignore_pbf", "value": "True" },
+        { "name": "build_elevation", "value": "False" },
+        { "name": "build_admins", "value": "False" },
+        { "name": "build_time_zones", "value": "False" },
+        { "name": "tile_urls", "value": "" },
+        { "name": "server_threads", "value": "4" }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -fsS http://localhost:8002/status || exit 1"],
+        "interval": 15,
+        "timeout": 5,
+        "retries": 5,
+        "startPeriod": 60
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/khmap-valhalla",
+          "awslogs-region": "<REGION>",
+          "awslogs-stream-prefix": "ecs",
+          "awslogs-create-group": "true"
+        }
+      }
+    }
+  ]
+}

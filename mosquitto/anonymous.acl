@@ -1,0 +1,21 @@
+# ACL for the rider listener (9001), which runs WITHOUT the go-auth plugin.
+#
+# Read-only on the public transit tree. Bus positions are not secret — a bus on
+# a public road is observable by anyone — so riders need no credential and the
+# mobile app ships with no embedded secret to leak.
+#
+# `topic`, not `pattern`. A pattern rule is for ACLs containing %u (username)
+# or %c (client id) substitutions; using it without either makes mosquitto log
+# "ACL pattern 'transit/#' does not contain '%c' or '%u'" and is simply the
+# wrong directive for a fixed topic.
+#
+# Rules here that appear before any `user` line apply to anonymous clients.
+# There is deliberately no write rule and no rule mentioning driver/#, so an
+# anonymous client can neither publish nor read driver topics: anything not
+# granted here is denied, and this listener has no plugin to defer to.
+#
+# Drivers and the backend do not use this file at all. They connect on
+# listeners that load the plugin, which resolves their permissions against the
+# API instead.
+
+topic read transit/#

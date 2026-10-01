@@ -1,0 +1,114 @@
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: bus_caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      - API_DOMAIN=${API_DOMAIN}
+      - MQTT_DOMAIN=${MQTT_DOMAIN}
+      # Separate hostname for the driver listener (9002), which loads the auth
+      # plugin. Riders use MQTT_DOMAIN -> 9001, which has no plugin.
+      - MQTT_DRIVER_DOMAIN=${MQTT_DRIVER_DOMAIN}
+    depends_on:
+      - api
+      - mqtt
+    networks:
+      - bus_net
+
+  api:
+    build:
+      context: .
+      target: production
+    container_name: bus_api
+    restart: unless-stopped
+    # Nest needs time to run onModuleDestroy: close the MQTT client, release
+    # the simulator's Redis lock, finish in-flight requests. The container
+    # default here was 1s, which SIGKILLed it every time (exit 137). Matches
+    # stopTimeout in deploy/taskdef-api.json so local and ECS behave alike.
+    stop_grace_period: 30s
+    env_file:
+      - .env.production
+    depends_on:
+      redis:
+        condition: service_healthy
+      mqtt:
+        condition: service_started
+      valhalla:
+        condition: service_healthy
+    networks:
+      - bus_net
+
+  mqtt:
+    build:
+      context: ./mosquitto
+    container_name: bus_mqtt
+    restart: unless-stopped
+    environment:
+      - MQTT_AUTH_INTERNAL_SECRET=${MQTT_AUTH_INTERNAL_SECRET}
+      # Where the auth plugin reaches the API. On ECS these become the API
+      # service's Service Connect name and port.
+      - API_INTERNAL_HOST=${API_INTERNAL_HOST:-api}
+      - API_INTERNAL_PORT=${API_INTERNAL_PORT:-3000}
+    volumes:
+      - ./mosquitto/mosquitto.prod.conf:/mosquitto/config/mosquitto.conf.template:ro
+      - ./mosquitto/anonymous.acl:/mosquitto/config/anonymous.acl:ro
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+    networks:
+      - bus_net
+
+  redis:
+    image: redis:alpine
+    container_name: bus_redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - bus_net
+
+  valhalla:
+    image: ghcr.io/gis-ops/docker-valhalla/valhalla:latest
+    container_name: bus_valhalla
+    restart: unless-stopped
+    volumes:
+      - ./valhalla/custom_files:/custom_files
+      - valhalla_tiles:/valhalla/tiles
+    environment:
+      - server_threads=${VALHALLA_SERVER_THREADS:-2}
+      - tile_urls=
+      - use_tiles_ignore_pbf=False
+      - force_rebuild=False
+      - build_elevation=False
+      - build_admins=True
+      - build_time_zones=True
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8002/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 120s
+    networks:
+      - bus_net
+
+volumes:
+  caddy_data:
+  caddy_config:
+  valhalla_tiles:
+  mosquitto_data:
+  mosquitto_log:
+
+networks:
+  bus_net:
+    driver: bridge
