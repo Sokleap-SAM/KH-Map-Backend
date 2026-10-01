@@ -1,0 +1,78 @@
+{
+  "family": "khmap-mosquitto",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/khmapEcsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/khmapMosquittoTaskRole",
+  "volumes": [
+    {
+      "name": "mosquitto-data",
+      "efsVolumeConfiguration": {
+        "fileSystemId": "<EFS_ID>",
+        "transitEncryption": "ENABLED",
+        "authorizationConfig": {
+          "accessPointId": "<EFS_ACCESS_POINT_ID>",
+          "iam": "ENABLED"
+        }
+      }
+    }
+  ],
+  "containerDefinitions": [
+    {
+      "name": "mosquitto",
+      "image": "<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/khmap-mosquitto:IMAGE_TAG",
+      "essential": true,
+      "portMappings": [
+        {
+          "name": "mqtt-ws-rider",
+          "containerPort": 9001,
+          "protocol": "tcp",
+          "appProtocol": "http"
+        },
+        {
+          "name": "mqtt-ws-driver",
+          "containerPort": 9002,
+          "protocol": "tcp",
+          "appProtocol": "http"
+        },
+        {
+          "name": "mqtt-tcp",
+          "containerPort": 1883,
+          "protocol": "tcp"
+        }
+      ],
+      "mountPoints": [
+        {
+          "sourceVolume": "mosquitto-data",
+          "containerPath": "/mosquitto/data",
+          "readOnly": false
+        }
+      ],
+      "environment": [
+        { "name": "API_INTERNAL_HOST", "value": "api.khmap.local" },
+        { "name": "API_INTERNAL_PORT", "value": "3000" }
+      ],
+      "secrets": [
+        { "name": "MQTT_AUTH_INTERNAL_SECRET", "valueFrom": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:khmap/prod:MQTT_AUTH_INTERNAL_SECRET::" }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/1883' || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 20
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/khmap-mosquitto",
+          "awslogs-region": "<REGION>",
+          "awslogs-stream-prefix": "ecs",
+          "awslogs-create-group": "true"
+        }
+      }
+    }
+  ]
+}

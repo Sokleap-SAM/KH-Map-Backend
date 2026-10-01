@@ -3,9 +3,9 @@ import { Types } from 'mongoose';
 
 @Schema({ timestamps: true })
 export class BaseEntity {
-  _id: Types.ObjectId;
+  _id!: Types.ObjectId;
 
-  createdAt: Date;
+  createdAt!: Date;
 
-  updatedAt: Date;
+  updatedAt!: Date;
 }
