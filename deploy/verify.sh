@@ -76,11 +76,23 @@ closes=$(aws logs tail /ecs/khmap-api --since "$WINDOW" --format short 2>/dev/nu
 if [ "${closes:-9}" -le 1 ]; then ok "API MQTT link stable ($closes close(s))"
 else bad "API MQTT reconnecting $closes times — duplicate client id?"; fi
 
+# A healthy long-lived connection logs NOTHING: MqttService only writes on
+# connect, close or error. So "no subscribe in this window" is ambiguous — it
+# means either never subscribed, or subscribed before the window opened and
+# stayed up since. The second is the better state, and an earlier version of
+# this check reported it as a failure.
+#
+# Treat it as healthy only when there is also no close and no error in the
+# window, i.e. nothing happened because nothing went wrong.
+errs=$(aws logs tail /ecs/khmap-api --since "$WINDOW" --format short 2>/dev/null \
+  | grep -c 'MQTT connection error')
 if aws logs tail /ecs/khmap-api --since "$WINDOW" --format short 2>/dev/null \
    | grep -q 'Subscribed to "driver/+/location"'; then
   ok 'API subscribed to driver/+/location'
+elif [ "${closes:-9}" -eq 0 ] && [ "${errs:-9}" -eq 0 ]; then
+  ok 'API MQTT quiet — connection predates this window and has not dropped'
 else
-  bad 'API never subscribed to driver/+/location'
+  bad 'API not subscribed to driver/+/location, and the link is unstable'
 fi
 
 # ─── 4. HTTP ─────────────────────────────────────────────────────────────────

@@ -175,6 +175,26 @@ export class MqttService implements OnModuleInit, OnModuleDestroy {
       typeof payload === 'string' ? payload : JSON.stringify(payload);
     this.client.publish(topic, body, options);
   }
+
+  /**
+   * Delete a retained message, so new subscribers stop receiving it.
+   *
+   * In MQTT a zero-length retained payload is the delete instruction: the
+   * broker drops the stored message rather than storing an empty one. It must
+   * genuinely be zero bytes — `publish(topic, null, { retain: true })` would
+   * send the four characters "null" through JSON.stringify and the broker would
+   * retain THAT, which looks like it worked and does the opposite.
+   *
+   * Needed because `transit/trip/<id>/detail` is retained per trip, and trip
+   * ids are unique forever. Without clearing, every finished trip leaves a
+   * permanent message, the broker's persistence file grows without bound, and
+   * every rider connecting to `transit/#` is served the full history of trips
+   * that ended months ago.
+   */
+  clearRetained(topic: string): void {
+    if (!this.client || !this.client.connected) return;
+    this.client.publish(topic, Buffer.alloc(0), { qos: 0, retain: true });
+  }
 }
 
 // MQTT topic wildcard match. `+` matches a single level, `#` matches zero or
