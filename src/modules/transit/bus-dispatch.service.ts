@@ -11,6 +11,7 @@ import {
 import { BusLocationService } from './bus-location.service';
 import { RedisService } from '../../shared/redis/redis.service';
 import { AppSettingsService } from '../app-settings/app-settings.service';
+import { MqttService } from '../../shared/mqtt/mqtt.service';
 import { TransitMode } from '../app-settings/enums/transit-mode.enum';
 
 /**
@@ -45,6 +46,7 @@ export class BusDispatchService {
     private readonly busLocationService: BusLocationService,
     private readonly redisService: RedisService,
     private readonly appSettings: AppSettingsService,
+    private readonly mqtt: MqttService,
   ) {}
 
   /**
@@ -61,11 +63,33 @@ export class BusDispatchService {
     mongoDeleted: { trips: number; buses: number; busLocations: number };
     redisDeleted: number;
   }> {
+    // Collect every trip id BEFORE deleting, so each retained MQTT message can
+    // be cleared. Order matters and is not merely tidy: a retained message can
+    // only be removed by publishing to its exact topic, and once the trip
+    // documents are gone there is no way to reconstruct those topic names.
+    // Deleting first would orphan them in the broker permanently, where they
+    // would be replayed to every rider subscribing to transit/# forever.
+    const allTrips = await this.busTripModel.find({}, { _id: 1 }).lean().exec();
+
     const [trips, buses, busLocations] = await Promise.all([
       this.busTripModel.deleteMany({}).exec(),
       this.busModel.deleteMany({}).exec(),
       this.busLocationModel.deleteMany({}).exec(),
     ]);
+
+    for (const t of allTrips) {
+      this.mqtt.clearRetained(`transit/trip/${String(t._id)}/detail`);
+    }
+
+    // Route positions too. These are normally self-limiting — the next trip on
+    // a route overwrites the previous retained value — but a full wipe leaves
+    // no fleet to overwrite them, so riders would keep seeing the last known
+    // position of buses that no longer exist until dispatch bootstraps again.
+    // Routes themselves survive the reset, so they can still be enumerated.
+    const routes = await this.busRouteModel.find({}, { _id: 1 }).lean().exec();
+    for (const r of routes) {
+      this.mqtt.clearRetained(`transit/route/${String(r._id)}/position`);
+    }
 
     const redisDeleted =
       (await this.redisService.deleteByPattern('bus:trip:*:location')) +
@@ -92,6 +116,13 @@ export class BusDispatchService {
    * fleet starts from a clean slate.
    */
   async cancelAllActiveTrips(): Promise<{ cancelled: number }> {
+    // Collect the ids BEFORE the update: afterwards the status no longer
+    // matches, and each one needs its retained MQTT message cleared by id.
+    const affected = await this.busTripModel
+      .find({ status: { $in: ['in-progress', 'scheduled'] } }, { _id: 1 })
+      .lean()
+      .exec();
+
     const result = await this.busTripModel
       .updateMany(
         { status: { $in: ['in-progress', 'scheduled'] } },
@@ -103,6 +134,12 @@ export class BusDispatchService {
     await this.redisService.deleteByPattern('trip:live:*');
     await this.redisService.deleteByPattern('route:lastDeparture:*');
     await this.redisService.del('bus:locations');
+
+    // The Redis wildcards above have no MQTT equivalent — a retained message
+    // can only be deleted by publishing to its exact topic, so this loops.
+    for (const t of affected) {
+      this.mqtt.clearRetained(`transit/trip/${String(t._id)}/detail`);
+    }
 
     return { cancelled: result.modifiedCount ?? 0 };
   }
@@ -151,6 +188,11 @@ export class BusDispatchService {
         { status: 'completed', completedAt: new Date() },
       )
       .exec();
+
+    // The trip is over, so its retained detail message must go too. This is the
+    // simulator's completion path and runs for every trip it finishes, so it is
+    // the main source of the accumulation if left out.
+    this.mqtt.clearRetained(`transit/trip/${tripId}/detail`);
 
     const hasScheduled = await this.busTripModel.exists({
       route: new Types.ObjectId(routeId),
