@@ -63,11 +63,33 @@ export class BusDispatchService {
     mongoDeleted: { trips: number; buses: number; busLocations: number };
     redisDeleted: number;
   }> {
+    // Collect every trip id BEFORE deleting, so each retained MQTT message can
+    // be cleared. Order matters and is not merely tidy: a retained message can
+    // only be removed by publishing to its exact topic, and once the trip
+    // documents are gone there is no way to reconstruct those topic names.
+    // Deleting first would orphan them in the broker permanently, where they
+    // would be replayed to every rider subscribing to transit/# forever.
+    const allTrips = await this.busTripModel.find({}, { _id: 1 }).lean().exec();
+
     const [trips, buses, busLocations] = await Promise.all([
       this.busTripModel.deleteMany({}).exec(),
       this.busModel.deleteMany({}).exec(),
       this.busLocationModel.deleteMany({}).exec(),
     ]);
+
+    for (const t of allTrips) {
+      this.mqtt.clearRetained(`transit/trip/${String(t._id)}/detail`);
+    }
+
+    // Route positions too. These are normally self-limiting — the next trip on
+    // a route overwrites the previous retained value — but a full wipe leaves
+    // no fleet to overwrite them, so riders would keep seeing the last known
+    // position of buses that no longer exist until dispatch bootstraps again.
+    // Routes themselves survive the reset, so they can still be enumerated.
+    const routes = await this.busRouteModel.find({}, { _id: 1 }).lean().exec();
+    for (const r of routes) {
+      this.mqtt.clearRetained(`transit/route/${String(r._id)}/position`);
+    }
 
     const redisDeleted =
       (await this.redisService.deleteByPattern('bus:trip:*:location')) +
