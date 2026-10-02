@@ -11,6 +11,7 @@ import {
 import { BusLocationService } from './bus-location.service';
 import { RedisService } from '../../shared/redis/redis.service';
 import { AppSettingsService } from '../app-settings/app-settings.service';
+import { MqttService } from '../../shared/mqtt/mqtt.service';
 import { TransitMode } from '../app-settings/enums/transit-mode.enum';
 
 /**
@@ -45,6 +46,7 @@ export class BusDispatchService {
     private readonly busLocationService: BusLocationService,
     private readonly redisService: RedisService,
     private readonly appSettings: AppSettingsService,
+    private readonly mqtt: MqttService,
   ) {}
 
   /**
@@ -92,6 +94,13 @@ export class BusDispatchService {
    * fleet starts from a clean slate.
    */
   async cancelAllActiveTrips(): Promise<{ cancelled: number }> {
+    // Collect the ids BEFORE the update: afterwards the status no longer
+    // matches, and each one needs its retained MQTT message cleared by id.
+    const affected = await this.busTripModel
+      .find({ status: { $in: ['in-progress', 'scheduled'] } }, { _id: 1 })
+      .lean()
+      .exec();
+
     const result = await this.busTripModel
       .updateMany(
         { status: { $in: ['in-progress', 'scheduled'] } },
@@ -103,6 +112,12 @@ export class BusDispatchService {
     await this.redisService.deleteByPattern('trip:live:*');
     await this.redisService.deleteByPattern('route:lastDeparture:*');
     await this.redisService.del('bus:locations');
+
+    // The Redis wildcards above have no MQTT equivalent — a retained message
+    // can only be deleted by publishing to its exact topic, so this loops.
+    for (const t of affected) {
+      this.mqtt.clearRetained(`transit/trip/${String(t._id)}/detail`);
+    }
 
     return { cancelled: result.modifiedCount ?? 0 };
   }
@@ -151,6 +166,11 @@ export class BusDispatchService {
         { status: 'completed', completedAt: new Date() },
       )
       .exec();
+
+    // The trip is over, so its retained detail message must go too. This is the
+    // simulator's completion path and runs for every trip it finishes, so it is
+    // the main source of the accumulation if left out.
+    this.mqtt.clearRetained(`transit/trip/${tripId}/detail`);
 
     const hasScheduled = await this.busTripModel.exists({
       route: new Types.ObjectId(routeId),
