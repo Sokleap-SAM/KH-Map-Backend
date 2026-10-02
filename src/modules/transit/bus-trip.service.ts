@@ -18,6 +18,7 @@ import { BusRouteStopService } from './bus-route-stop.service';
 import { BusRouteStop } from './entities/bus-route-stop.schema';
 import { BusLocationService } from './bus-location.service';
 import { RedisService } from '../../shared/redis/redis.service';
+import { MqttService } from '../../shared/mqtt/mqtt.service';
 import { haversineMeters } from '../../shared/helpers/helper-functions';
 import {
   BUS_SIMULATION_SPEED_KMH,
@@ -53,6 +54,7 @@ export class BusTripService {
     private readonly busRouteStopService: BusRouteStopService,
     private readonly busLocationService: BusLocationService,
     private readonly redisService: RedisService,
+    private readonly mqtt: MqttService,
   ) {}
 
   private tripLiveKey(tripId: string): string {
@@ -99,6 +101,16 @@ export class BusTripService {
   async clearLiveData(tripId: string): Promise<void> {
     await this.redisService.hdel(this.tripLiveKey(tripId));
     await this.redisService.georemove(this.GEO_KEY, tripId);
+    // Drop the retained MQTT message for this trip. `transit/trip/<id>/detail`
+    // is retained so a rider tapping a bus gets its detail immediately rather
+    // than waiting for the next throttled publish — but trip ids are unique
+    // forever, so without this every finished trip leaves one behind
+    // permanently. They accumulate in the broker's persistence file and are all
+    // replayed to every rider that subscribes to `transit/#`.
+    //
+    // The route topic needs no equivalent: it keys on routeId, so the next trip
+    // on that route overwrites it and the retained set stays bounded.
+    this.mqtt.clearRetained(`transit/trip/${tripId}/detail`);
     // Also clear bus-location's namespace (separate keys consumed by the
     // routing service's `getLivePositionsByRoute`). Without this, ending a
     // trip via the API only cleans this service's keys and the routing layer
