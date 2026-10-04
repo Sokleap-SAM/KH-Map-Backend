@@ -44,6 +44,7 @@ import { FavoriteTransitRouteService } from './favorite-transit-route.service';
 import { PlanRouteDto } from './dto/plan-route.dto';
 import { ReportBusLocationDto } from './dto/report-bus-location.dto';
 import { CreateFavoriteTransitRouteDto } from './dto/create-favorite-transit-route.dto';
+import { ResetDispatchDto } from './dto/reset-dispatch.dto';
 
 @Controller('transit')
 export class TransitController {
@@ -533,26 +534,42 @@ export class TransitController {
     return this.favoriteTransitRouteService.remove(new Types.ObjectId(id));
   }
 
-  // ─── Dispatch (dev only) ──────────────────────────────────────────────────
+  // ─── Dispatch (admin) ─────────────────────────────────────────────────────
 
   /**
-   * DEV ONLY: wipe every bus, trip, and bus-location record (Mongo) and the
-   * matching Redis keys, then clear the simulator's in-memory trip cache.
-   * Routes and route-stops are preserved — only the fleet is reset, so the
-   * dispatch service's bootstrap path runs fresh on the next sync.
+   * Wipe every bus, trip, and bus-location record (Mongo), the matching Redis
+   * keys and retained MQTT messages, then clear the simulator's in-memory trip
+   * cache. Routes and route-stops are preserved — only the fleet is reset, so
+   * the dispatch service's bootstrap path runs fresh on the next sync.
    *
-   * Refuses to run when `NODE_ENV === 'production'`. Useful in development
-   * after schema changes or to start over with a clean queue.
+   * Allowed in production. The previous `NODE_ENV` block guarded the wrong
+   * thing: an admin resetting a simulated fleet is a normal operation, and in
+   * simulation mode it is self-healing because `dispatchForRoute` recreates
+   * buses on the next tick.
    *
-   * POST /transit/dispatch/reset
+   * Refused in LIVE mode, which is the case that is genuinely destructive.
+   * There `BusDispatchService.run()` returns early and never recreates buses,
+   * so the wipe leaves every driver's `assignedBusId` pointing at a deleted
+   * document. That state is silent rather than loud — MQTT credentials still
+   * issue, but no trip exists on the missing bus, so driver position publishes
+   * are dropped with no error — and recovering means recreating the fleet and
+   * reassigning every driver by hand. Switch to simulation mode first if a
+   * reset is really intended.
+   *
+   * POST /transit/dispatch/reset   body: { "confirm": "RESET_FLEET" }
    */
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN)
   @Post('dispatch/reset')
-  async resetDispatch() {
-    if (process.env.NODE_ENV === 'production') {
+  // The DTO exists purely so the global ValidationPipe rejects a request that
+  // lacks the confirmation string; nothing in the body is read here.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  async resetDispatch(@Body() _dto: ResetDispatchDto) {
+    if (this.appSettings.getMode() === TransitMode.LIVE) {
       throw new ForbiddenException(
-        'Fleet reset is disabled in production. Run this in dev only.',
+        'Fleet reset is disabled in live mode: buses are not re-bootstrapped, ' +
+          'so this would orphan every driver bus assignment. Switch to ' +
+          'simulation mode first.',
       );
     }
     this.busSimulationService.clearInMemoryState();
