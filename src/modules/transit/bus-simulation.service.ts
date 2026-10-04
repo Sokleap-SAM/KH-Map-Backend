@@ -99,6 +99,24 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
   private readonly instanceId = Math.random().toString(36).slice(2);
   private static readonly LOCK_KEY = 'sim:master:lock';
 
+  /**
+   * Cluster-wide run intent, as opposed to {@link _running}, which is only this
+   * process's local state.
+   *
+   * With more than one API task exactly one instance holds the lock and has
+   * `_running === true`; the rest are idle retriers. An admin stop therefore
+   * cannot be served from process memory — the request lands on an arbitrary
+   * task, and if that is not the lock holder the old code returned early before
+   * releasing the lock and nothing stopped. Worse, when it *did* land on the
+   * holder, the lock was freed and another instance picked it up within its 5 s
+   * retry, so the simulation migrated instead of stopping.
+   *
+   * Keeping the intent in Redis makes it visible to whichever instance is
+   * actually simulating. A missing key means enabled, so a fresh Redis keeps
+   * the existing auto-start behaviour.
+   */
+  private static readonly ENABLED_KEY = 'sim:enabled';
+
   constructor(
     @InjectModel(BusTrip.name)
     private readonly busTripModel: Model<BusTripDocument>,
@@ -119,9 +137,13 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
   private startRetryHandle: ReturnType<typeof setTimeout> | null = null;
 
   onModuleInit(): void {
-    // Don't await — start() may schedule retries (Redis warming up) and we
+    // Don't await — resume() may schedule retries (Redis warming up) and we
     // mustn't block the Nest bootstrap on that.
-    void this.start();
+    //
+    // resume(), not start(): a redeploy must not resurrect a simulation an
+    // admin deliberately stopped, so boot respects the stored intent rather
+    // than asserting a new one.
+    void this.resume();
   }
 
   onModuleDestroy(): void {
@@ -131,13 +153,55 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
   // ─── Public API ────────────────────────────────────────────────────────────
 
   /**
-   * Start the simulation loop. No-op if already running. Safe to call before
-   * Redis is connected — the lock acquisition is retried until it succeeds
-   * (or {@link stop} cancels the intent).
+   * Start the simulation across the cluster. Records the intent in Redis so the
+   * instance that ends up holding the lock keeps running even if a later task
+   * restart is what actually acquires it.
    */
   async start(): Promise<void> {
+    await this.redisService.set(BusSimulationService.ENABLED_KEY, true);
+    await this.resume();
+  }
+
+  /**
+   * Try to become the simulating instance, honouring the stored intent. Used at
+   * boot and by the retry loop; does not change what the cluster wants.
+   */
+  private async resume(): Promise<void> {
     this.wantedRunning = true;
     await this.attemptStart();
+  }
+
+  /**
+   * Stop the simulation across the cluster, whichever instance is running it.
+   * Clears the shared intent first, then stops locally; a different lock holder
+   * notices on its next sync (~5 s) and stops itself.
+   */
+  async stopCluster(): Promise<void> {
+    await this.redisService.set(BusSimulationService.ENABLED_KEY, false);
+    this.stop();
+  }
+
+  /**
+   * Whether the simulation is running anywhere in the cluster, which is what an
+   * admin actually wants to know. {@link running} answers only for this process
+   * and is a coin flip behind a load balancer.
+   */
+  async isRunningAnywhere(): Promise<boolean> {
+    if (this._running) return true;
+    const owner = await this.redisService.get<string>(
+      BusSimulationService.LOCK_KEY,
+    );
+    return owner !== null;
+  }
+
+  /** False only when an admin has explicitly stopped the simulation. */
+  private async isEnabledInCluster(): Promise<boolean> {
+    const enabled = await this.redisService.get<boolean>(
+      BusSimulationService.ENABLED_KEY,
+    );
+    // null covers both "never set" and "Redis unreachable". Default to enabled
+    // so a Redis blip cannot silently halt the simulation everywhere.
+    return enabled !== false;
   }
 
   private async attemptStart(): Promise<void> {
@@ -148,6 +212,11 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
     // them. Refuse to start so a stale `await start()` from boot doesn't
     // resurrect the sim loop after admin flipped to live.
     if (this.appSettings.getMode() === TransitMode.LIVE) return;
+
+    // An admin stop applies to every instance, including one that is only now
+    // booting or retrying. Checked before the lock so a stopped simulation is
+    // never briefly resurrected by a task restart.
+    if (!(await this.isEnabledInCluster())) return this.scheduleRetry();
 
     // Acquire a distributed lock so only one instance runs the simulation.
     // On single-instance deploys this is a no-op; on multi-instance it prevents
@@ -163,17 +232,25 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
       /* swallow */
     }
 
-    if (!acquired) {
-      this.startRetryHandle = setTimeout(() => {
-        this.startRetryHandle = null;
-        void this.attemptStart();
-      }, 5_000);
-      return;
-    }
+    if (!acquired) return this.scheduleRetry();
 
     this._running = true;
     this.tickCount = 0;
     this.intervalHandle = setInterval(() => void this.runTick(), TICK_MS);
+  }
+
+  /**
+   * Re-try becoming the simulating instance in 5 s. Replaces any pending retry
+   * rather than adding one: there are two callers and `start()` can be invoked
+   * while a retry is already queued, which would otherwise leave a second
+   * independent poller running for the life of the process.
+   */
+  private scheduleRetry(): void {
+    if (this.startRetryHandle) clearTimeout(this.startRetryHandle);
+    this.startRetryHandle = setTimeout(() => {
+      this.startRetryHandle = null;
+      void this.attemptStart();
+    }, 5_000);
   }
 
   /** Stop the loop and clear all in-memory state. No-op if already stopped. */
@@ -267,6 +344,15 @@ export class BusSimulationService implements OnModuleInit, OnModuleDestroy {
    * Also renews the distributed lock TTL so it doesn't expire mid-operation.
    */
   private async syncActiveTrips(): Promise<void> {
+    // An admin stop may have been served by a different task, which can only
+    // record the intent in Redis. This is where the instance that actually
+    // holds the lock finds out and stands down — checked before renewing, so a
+    // stop doesn't have to wait out the lock TTL.
+    if (!(await this.isEnabledInCluster())) {
+      this.stop();
+      return;
+    }
+
     // Renew lock — fire-and-forget so a slow Redis call can't freeze the tick.
     // The TTL is 30 s and syncs happen every 5 s, so one missed renewal is safe.
     this.redisService
