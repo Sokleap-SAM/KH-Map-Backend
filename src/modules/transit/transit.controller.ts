@@ -109,7 +109,10 @@ export class TransitController {
 
     try {
       if (dto.mode === TransitMode.LIVE) {
-        this.busSimulationService.stop();
+        // stopCluster, not stop: the simulator may be running on a different
+        // task than the one serving this PATCH, and a local stop would leave it
+        // moving simulated buses alongside the real drivers.
+        await this.busSimulationService.stopCluster();
         const cancelled = await this.busDispatchService.cancelAllActiveTrips();
         return { mode: dto.mode, changed: true, ...cancelled };
       }
@@ -441,8 +444,14 @@ export class TransitController {
   // ─── Simulation ───────────────────────────────────────────────────────────
 
   /**
-   * Returns whether the bus simulation loop is currently active and the
-   * number of trips it is tracking.
+   * Returns whether the bus simulation loop is active anywhere in the cluster,
+   * and the number of trips it is tracking.
+   *
+   * `running` is deliberately the CLUSTER state, not this process's. Only one
+   * instance holds the simulation lock, so a per-process answer was a coin flip
+   * behind the load balancer: with two API tasks, half of these requests
+   * reported `false` while buses were visibly moving. `onThisInstance` keeps the
+   * local view available for debugging.
    *
    * GET /transit/simulation/status
    */
@@ -450,15 +459,19 @@ export class TransitController {
   @Roles(UserRole.ADMIN)
   @Get('simulation/status')
   async getSimulationStatus() {
-    const activeTrips = await this.busTripService.findActive();
+    const [activeTrips, running] = await Promise.all([
+      this.busTripService.findActive(),
+      this.busSimulationService.isRunningAnywhere(),
+    ]);
     return {
-      running: this.busSimulationService.running,
+      running,
+      onThisInstance: this.busSimulationService.running,
       activeTrips: activeTrips.length,
     };
   }
 
   /**
-   * Start the simulation loop (idempotent).
+   * Start the simulation loop (idempotent, cluster-wide).
    *
    * POST /transit/simulation/start
    */
@@ -467,20 +480,32 @@ export class TransitController {
   @Post('simulation/start')
   async startSimulation() {
     await this.busSimulationService.start();
-    return { running: this.busSimulationService.running };
+    return { running: await this.busSimulationService.isRunningAnywhere() };
   }
 
   /**
-   * Stop the simulation loop (idempotent).
+   * Stop the simulation loop (idempotent, cluster-wide).
+   *
+   * Uses stopCluster rather than stop: the request lands on an arbitrary task,
+   * and a local stop either did nothing (not the lock holder) or released the
+   * lock for another instance to claim within 5 s, which migrated the
+   * simulation instead of stopping it.
    *
    * POST /transit/simulation/stop
    */
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles(UserRole.ADMIN)
   @Post('simulation/stop')
-  stopSimulation() {
-    this.busSimulationService.stop();
-    return { running: this.busSimulationService.running };
+  async stopSimulation() {
+    await this.busSimulationService.stopCluster();
+    const running = await this.busSimulationService.isRunningAnywhere();
+    return {
+      running,
+      // True when the lock holder is a different task than the one that served
+      // this request: it stands down on its next sync (~5 s). Poll status
+      // rather than reading this as a failed stop.
+      pendingOnAnotherInstance: running,
+    };
   }
 
   // ─── Favorite Transit Routes ──────────────────────────────────────────────
